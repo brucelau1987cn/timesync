@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VPS 时区自动校准脚本 v2.1
+# VPS 时区自动校准脚本 v2.2
 # 根据公网 IP 归属地自动识别所在时区并完成校准
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
 # 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
@@ -177,6 +177,7 @@ sync_time() {
   if command -v chronyc &>/dev/null; then
     if chronyc makestep &>/dev/null; then
       success "chrony 时间同步完成"
+      info "同步后时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
       return
     else
       warn "chronyc makestep 执行失败，尝试其他方式..."
@@ -187,6 +188,7 @@ sync_time() {
   if command -v ntpdate &>/dev/null; then
     if ntpdate -u pool.ntp.org &>/dev/null; then
       success "ntpdate 时间同步完成"
+      info "同步后时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
       return
     else
       warn "ntpdate 执行失败，尝试其他方式..."
@@ -196,43 +198,51 @@ sync_time() {
   # ---- systemd-timesyncd ----
   if command -v timedatectl &>/dev/null; then
     timedatectl set-ntp true 2>/dev/null || true
+    # 修复：((i++)) 在 i=0 时返回 1，被 set -e 杀死
+    # 改用 i=$((i + 1)) 避免此问题
     local i=0
     while [[ $i -lt 10 ]]; do
-      sleep 1; ((i++))
+      sleep 1
+      i=$((i + 1))
       if timedatectl show --property=NTPSynchronized 2>/dev/null | grep -q "yes"; then
-        success "systemd-timesyncd 时间同步完成"
+        success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
+        info "同步后时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
         return
       fi
     done
-    warn "systemd-timesyncd 同步超时，时间可能仍有偏差"
+    warn "systemd-timesyncd 同步等待超时（10秒），时间可能仍有偏差"
+    info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
     return
   fi
 
-  warn "未找到 chrony / ntpdate / systemd-timesyncd，跳过时间同步"
+  # ---- 尝试直接通过 HTTP 获取网络时间作参考 ----
+  warn "未找到 chrony / ntpdate / systemd-timesyncd"
+  info "当前系统时间: $(date '+%Y-%m-%d %H:%M:%S %Z')（未同步，可能有偏差）"
 }
 
 # ---------- 输出校准结果 ----------
 print_result() {
   local tz="$1"
-  echo ""
-  echo -e "${BOLD}========== 时区校准结果 ==========${RESET}"
-  echo -e "  校准时区: ${GREEN}${tz}${RESET}"
+  echo "" >&2
+  echo -e "${BOLD}========== 时区校准结果 ==========${RESET}" >&2
+  echo -e "  校准时区: ${GREEN}${tz}${RESET}" >&2
   if ! $DRY_RUN; then
-    echo -e "  当前时间: ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${RESET}"
+    echo -e "  当前时间: ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${RESET}" >&2
+    echo -e "  UTC  时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >&2
     if command -v timedatectl &>/dev/null; then
-      echo ""
-      timedatectl status 2>/dev/null | grep -E "(Local time|Time zone|NTP)" | sed 's/^/  /' || true
+      echo "" >&2
+      timedatectl status 2>/dev/null | grep -E "(Local time|Time zone|NTP|synchronized)" | sed 's/^/  /' >&2 || true
     fi
   fi
-  echo -e "${BOLD}==================================${RESET}"
+  echo -e "${BOLD}==================================${RESET}" >&2
 }
 
 # ---------- 主流程 ----------
 main() {
-  echo ""
-  echo -e "${BOLD}========== VPS 时区自动校准脚本 ==========${RESET}"
+  echo "" >&2
+  echo -e "${BOLD}========== VPS 时区自动校准脚本 ==========${RESET}" >&2
   $DRY_RUN && warn "dry-run 模式：仅检测，不修改系统"
-  echo ""
+  echo "" >&2
 
   local target_tz=""
 
@@ -245,12 +255,12 @@ main() {
 
   info "目标时区: ${target_tz}"
 
-  # 获取当前时区
+  # 获取当前时区（每步都 || true 防止 set -e）
   local current_tz=""
-  current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null \
-    || cat /etc/timezone 2>/dev/null \
-    || readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' \
-    || echo "unknown")
+  current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
+  [[ -z "$current_tz" ]] && current_tz=$(cat /etc/timezone 2>/dev/null || true)
+  [[ -z "$current_tz" ]] && current_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+  [[ -z "$current_tz" ]] && current_tz="unknown"
 
   if [[ "$current_tz" == "$target_tz" ]]; then
     success "当前时区 [${current_tz}] 已与目标一致，无需修改"
