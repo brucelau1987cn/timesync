@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VPS 时区自动校准脚本 v2
+# VPS 时区自动校准脚本 v2.1
 # 根据公网 IP 归属地自动识别所在时区并完成校准
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
 # 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
@@ -62,20 +62,20 @@ declare -A COUNTRY_TZ=(
   [CN]="Asia/Shanghai"     [JP]="Asia/Tokyo"        [KR]="Asia/Seoul"
   [SG]="Asia/Singapore"    [HK]="Asia/Hong_Kong"    [TW]="Asia/Taipei"
   [TH]="Asia/Bangkok"      [VN]="Asia/Ho_Chi_Minh"  [MY]="Asia/Kuala_Lumpur"
-  [ID]="Asia/Jakarta"      [PH]="Asia/Manila"        [IN]="Asia/Kolkata"
-  [PK]="Asia/Karachi"      [BD]="Asia/Dhaka"         [LK]="Asia/Colombo"
-  [NP]="Asia/Kathmandu"    [AE]="Asia/Dubai"         [SA]="Asia/Riyadh"
-  [QA]="Asia/Qatar"        [KW]="Asia/Kuwait"        [IL]="Asia/Jerusalem"
-  [TR]="Europe/Istanbul"   [RU]="Europe/Moscow"      [DE]="Europe/Berlin"
-  [FR]="Europe/Paris"      [GB]="Europe/London"      [NL]="Europe/Amsterdam"
-  [IT]="Europe/Rome"       [ES]="Europe/Madrid"      [PL]="Europe/Warsaw"
-  [SE]="Europe/Stockholm"  [NO]="Europe/Oslo"        [FI]="Europe/Helsinki"
-  [CH]="Europe/Zurich"     [AT]="Europe/Vienna"      [PT]="Europe/Lisbon"
-  [US]="America/New_York"  [CA]="America/Toronto"    [MX]="America/Mexico_City"
+  [ID]="Asia/Jakarta"      [PH]="Asia/Manila"       [IN]="Asia/Kolkata"
+  [PK]="Asia/Karachi"      [BD]="Asia/Dhaka"        [LK]="Asia/Colombo"
+  [NP]="Asia/Kathmandu"    [AE]="Asia/Dubai"        [SA]="Asia/Riyadh"
+  [QA]="Asia/Qatar"        [KW]="Asia/Kuwait"       [IL]="Asia/Jerusalem"
+  [TR]="Europe/Istanbul"   [RU]="Europe/Moscow"     [DE]="Europe/Berlin"
+  [FR]="Europe/Paris"      [GB]="Europe/London"     [NL]="Europe/Amsterdam"
+  [IT]="Europe/Rome"       [ES]="Europe/Madrid"     [PL]="Europe/Warsaw"
+  [SE]="Europe/Stockholm"  [NO]="Europe/Oslo"       [FI]="Europe/Helsinki"
+  [CH]="Europe/Zurich"     [AT]="Europe/Vienna"     [PT]="Europe/Lisbon"
+  [US]="America/New_York"  [CA]="America/Toronto"   [MX]="America/Mexico_City"
   [BR]="America/Sao_Paulo" [AR]="America/Argentina/Buenos_Aires"
-  [CL]="America/Santiago"  [CO]="America/Bogota"     [PE]="America/Lima"
-  [AU]="Australia/Sydney"  [NZ]="Pacific/Auckland"   [ZA]="Africa/Johannesburg"
-  [NG]="Africa/Lagos"      [EG]="Africa/Cairo"       [KE]="Africa/Nairobi"
+  [CL]="America/Santiago"  [CO]="America/Bogota"    [PE]="America/Lima"
+  [AU]="Australia/Sydney"  [NZ]="Pacific/Auckland"  [ZA]="Africa/Johannesburg"
+  [NG]="Africa/Lagos"      [EG]="Africa/Cairo"      [KE]="Africa/Nairobi"
 )
 
 # ---------- 验证时区合法性 ----------
@@ -96,7 +96,6 @@ find_zoneinfo_base() {
 }
 
 # ---------- 获取 IP 和时区信息 ----------
-# 重要：所有 info/warn 走 stderr，只有最终时区名 echo 到 stdout
 detect_timezone() {
   info "正在检测公网 IP 归属地..."
 
@@ -137,7 +136,6 @@ detect_timezone() {
 
   [[ -z "$tz" ]] && die "无法获取时区信息。请检查网络，或使用 --force TIMEZONE 手动指定"
 
-  # 唯一输出到 stdout 的内容：纯时区字符串
   echo "$tz"
 }
 
@@ -166,7 +164,7 @@ apply_timezone() {
   fi
 }
 
-# ---------- 同步网络时间 ----------
+# ---------- 同步网络时间（已修复 set -e 兼容性） ----------
 sync_time() {
   if $DRY_RUN; then
     info "[dry-run] 将执行网络时间同步"
@@ -175,21 +173,35 @@ sync_time() {
 
   info "正在同步网络时间..."
 
+  # ---- chrony ----
   if command -v chronyc &>/dev/null; then
-    chronyc makestep &>/dev/null && success "chrony 时间同步完成" && return
+    if chronyc makestep &>/dev/null; then
+      success "chrony 时间同步完成"
+      return
+    else
+      warn "chronyc makestep 执行失败，尝试其他方式..."
+    fi
   fi
 
+  # ---- ntpdate ----
   if command -v ntpdate &>/dev/null; then
-    ntpdate -u pool.ntp.org &>/dev/null && success "ntpdate 时间同步完成" && return
+    if ntpdate -u pool.ntp.org &>/dev/null; then
+      success "ntpdate 时间同步完成"
+      return
+    else
+      warn "ntpdate 执行失败，尝试其他方式..."
+    fi
   fi
 
+  # ---- systemd-timesyncd ----
   if command -v timedatectl &>/dev/null; then
-    timedatectl set-ntp true
+    timedatectl set-ntp true 2>/dev/null || true
     local i=0
     while [[ $i -lt 10 ]]; do
       sleep 1; ((i++))
       if timedatectl show --property=NTPSynchronized 2>/dev/null | grep -q "yes"; then
-        success "systemd-timesyncd 时间同步完成"; return
+        success "systemd-timesyncd 时间同步完成"
+        return
       fi
     done
     warn "systemd-timesyncd 同步超时，时间可能仍有偏差"
@@ -209,7 +221,7 @@ print_result() {
     echo -e "  当前时间: ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${RESET}"
     if command -v timedatectl &>/dev/null; then
       echo ""
-      timedatectl status 2>/dev/null | grep -E "(Local time|Time zone|NTP)" | sed 's/^/  /'
+      timedatectl status 2>/dev/null | grep -E "(Local time|Time zone|NTP)" | sed 's/^/  /' || true
     fi
   fi
   echo -e "${BOLD}==================================${RESET}"
