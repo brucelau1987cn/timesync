@@ -1,4 +1,4 @@
 # VPS 时区自动校准脚本 v2
-# 根据公网 IP 归属地自动识别所在时区并完成校准
-# 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
-# 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
+## 根据公网 IP 归属地自动识别所在时区并完成校准
+## 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
+## 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
