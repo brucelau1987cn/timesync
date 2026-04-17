@@ -5,4 +5,4 @@
 ## 🚀 一键运行
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-calibrate/main/tz-calibrate.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-calibrate/main/tz-chronyd.sh)
