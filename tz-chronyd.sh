@@ -3,8 +3,9 @@
 # ============================================================
 # VPS 时区和时间自动校准脚本
 # 根据公网 IP 归属地自动调整时区并同步时间
+# 使用 chronyd 工具同步
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等主流发行版
-# 用法：bash tz-calibrate.sh
+# 用法：bash tz-chronyd.sh
 # ============================================================
 
 # 颜色定义
@@ -34,6 +35,38 @@ separator() {
 }
 
 #================================================================
+# 检测包管理器并安装软件
+#================================================================
+install_package() {
+    local pkg="$1"
+    log_info "正在安装 ${pkg}..."
+
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q "$pkg" >/dev/null 2>&1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q "$pkg" >/dev/null 2>&1
+    elif command -v apk &>/dev/null; then
+        apk add --quiet "$pkg" >/dev/null 2>&1
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm --quiet "$pkg" >/dev/null 2>&1
+    else
+        log_error "未识别的包管理器，无法安装 ${pkg}"
+        return 1
+    fi
+
+    if [[ $? -eq 0 ]]; then
+        log_ok "${pkg} 安装成功"
+        return 0
+    else
+        log_error "${pkg} 安装失败"
+        return 1
+    fi
+}
+
+#================================================================
 # 第一阶段：获取公网IP和时区信息
 #================================================================
 stage_get_info() {
@@ -43,8 +76,9 @@ stage_get_info() {
     separator
     echo ""
 
-    # 1. 获取公网IPv4
+    # 获取公网IPv4
     log_info "正在获取公网IPv4地址..."
+
     PUBLIC_IP=$(curl -4 -s --max-time 10 ip.sb 2>/dev/null)
     if [[ -z "$PUBLIC_IP" ]]; then
         log_warn "ip.sb 失败，尝试 ifconfig.me..."
@@ -58,10 +92,11 @@ stage_get_info() {
         log_error "所有方法均无法获取公网IP，脚本退出"
         exit 1
     fi
+
     log_ok "公网IPv4: ${GREEN}${PUBLIC_IP}${NC}"
 
-    # 2. 通过 ipinfo.io 查询完整信息
-    log_info "正在查询IP归属信息..."
+    # 通过 ipinfo.io 查询完整信息
+    log_info "正在查询IP归属信息 (ipinfo.io/${PUBLIC_IP})..."
     local raw_json=""
     raw_json=$(curl -s --max-time 15 "https://ipinfo.io/${PUBLIC_IP}" 2>/dev/null)
 
@@ -70,7 +105,7 @@ stage_get_info() {
         exit 1
     fi
 
-    # 3. 解析JSON
+    # 解析JSON
     if command -v jq &>/dev/null; then
         DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty')
         COUNTRY=$(echo "$raw_json" | jq -r '.country // empty')
@@ -128,7 +163,7 @@ stage_set_timezone() {
         return 0
     fi
 
-    # 检查目标时区文件是否存在
+    # 检查目标时区文件
     if [[ ! -f "/usr/share/zoneinfo/${tz}" ]]; then
         log_error "时区文件不存在: /usr/share/zoneinfo/${tz}"
         exit 1
@@ -214,11 +249,6 @@ stage_sync_time() {
             ntp_secondary="time.google.com"
             ntp_tertiary="time.cloudflare.com"
             ;;
-        Asia/Bangkok|Asia/Ho_Chi_Minh|Asia/Jakarta|Asia/Manila)
-            ntp_primary="asia.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
         Asia/*)
             ntp_primary="asia.pool.ntp.org"
             ntp_secondary="time.google.com"
@@ -281,24 +311,44 @@ stage_sync_time() {
             ;;
     esac
 
-    log_ok "主NTP服务器: ${GREEN}${ntp_primary}${NC}"
-    log_ok "备NTP服务器: ${GREEN}${ntp_secondary}${NC}"
-    log_ok "三NTP服务器: ${GREEN}${ntp_tertiary}${NC}"
+    log_ok "主NTP: ${GREEN}${ntp_primary}${NC}"
+    log_ok "备NTP: ${GREEN}${ntp_secondary}${NC}"
+    log_ok "三NTP: ${GREEN}${ntp_tertiary}${NC}"
     echo ""
 
-    # ---- 检测同步工具 ----
+    # ---- 检测同步工具，没有就自动安装 ----
     local sync_tool=""
+
     if command -v chronyd &>/dev/null; then
         sync_tool="chrony"
-    elif command -v ntpd &>/dev/null; then
-        sync_tool="ntpd"
     elif command -v ntpdate &>/dev/null; then
         sync_tool="ntpdate"
-    elif command -v sntp &>/dev/null; then
-        sync_tool="sntp"
+    elif command -v ntpd &>/dev/null; then
+        sync_tool="ntpd"
     else
-        sync_tool="http"
+        log_warn "未检测到NTP工具，正在自动安装 chrony..."
+        echo ""
+
+        # 尝试安装 chrony
+        if install_package "chrony"; then
+            sync_tool="chrony"
+        else
+            log_warn "chrony 安装失败，尝试安装 ntpdate..."
+            if install_package "ntpdate"; then
+                sync_tool="ntpdate"
+            else
+                log_warn "ntpdate 安装失败，尝试安装 ntp..."
+                if install_package "ntp"; then
+                    sync_tool="ntpd"
+                else
+                    sync_tool="http"
+                    log_warn "所有NTP工具安装失败，将使用HTTP方式同步"
+                fi
+            fi
+        fi
+        echo ""
     fi
+
     log_info "同步工具: ${GREEN}${sync_tool}${NC}"
 
     # 记录同步前时间
@@ -314,18 +364,22 @@ stage_sync_time() {
         chrony)
             log_info "配置 Chrony..."
 
-            # 查找chrony配置文件路径
+            # 查找配置文件路径
             local chrony_conf="/etc/chrony/chrony.conf"
             if [[ ! -d "/etc/chrony" ]]; then
-                chrony_conf="/etc/chrony.conf"
+                if [[ -f "/etc/chrony.conf" ]]; then
+                    chrony_conf="/etc/chrony.conf"
+                else
+                    mkdir -p /etc/chrony 2>/dev/null
+                fi
             fi
 
             # 备份原配置
             if [[ -f "$chrony_conf" ]]; then
-                cp "$chrony_conf" "${chrony_conf}.bak.$(date +%s)" 2>/dev/null || true
+                cp "$chrony_conf" "${chrony_conf}.bak" 2>/dev/null || true
             fi
 
-            # 写入新配置（不用heredoc变量展开，手动拼接）
+            # 写入新配置
             {
                 echo "# Auto-generated by vps-time-sync"
                 echo "server ${ntp_primary} iburst"
@@ -335,31 +389,63 @@ stage_sync_time() {
                 echo "driftfile /var/lib/chrony/chrony.drift"
                 echo "makestep 1.0 3"
                 echo "rtcsync"
-                echo "allow all"
             } > "$chrony_conf"
 
-            log_ok "Chrony 配置已写入: ${chrony_conf}"
+            log_ok "配置已写入: ${chrony_conf}"
 
+            # 启动服务
+            systemctl stop chronyd 2>/dev/null || true
+            sleep 1
             systemctl enable chronyd 2>/dev/null || true
-            systemctl restart chronyd 2>/dev/null || true
+            systemctl start chronyd 2>/dev/null || true
             log_info "等待 Chrony 同步（5秒）..."
             sleep 5
 
-            if chronyc makestep >/dev/null 2>&1; then
+            # 强制同步
+            if chronyc -a makestep >/dev/null 2>&1; then
                 sync_ok=true
                 log_ok "Chrony makestep 执行成功"
+            else
+                log_warn "chronyc makestep 返回异常，检查同步状态..."
             fi
 
-            # 显示chrony源状态
+            # 再等一下让同步稳定
+            sleep 2
+
+            # 显示源状态
             echo ""
-            log_info "Chrony 同步源状态:"
+            log_info "Chrony 同步源:"
+            echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
             chronyc sources 2>/dev/null | while IFS= read -r line; do
-                echo -e "         ${line}"
+                echo -e "  $line"
             done
+            echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
+
             echo ""
-            log_info "Chrony tracking 信息:"
+            log_info "Chrony tracking:"
+            echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
             chronyc tracking 2>/dev/null | while IFS= read -r line; do
-                echo -e "         ${line}"
+                echo -e "  $line"
+            done
+            echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
+            ;;
+
+        ntpdate)
+            log_info "使用 ntpdate 单次同步..."
+            local ntpdate_output=""
+
+            # 按优先级尝试
+            for srv in "$ntp_primary" "$ntp_secondary" "$ntp_tertiary"; do
+                log_info "尝试 ${srv}..."
+                ntpdate_output=$(ntpdate -b "$srv" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                    sync_ok=true
+                    log_ok "ntpdate 同步成功 (${srv})"
+                    echo -e "         ${ntpdate_output}"
+                    break
+                else
+                    log_warn "${srv} 失败: ${ntpdate_output}"
+                fi
             done
             ;;
 
@@ -368,70 +454,68 @@ stage_sync_time() {
             systemctl stop ntpd 2>/dev/null || true
 
             if [[ -f /etc/ntp.conf ]]; then
-                cp /etc/ntp.conf /etc/ntp.conf.bak.$(date +%s) 2>/dev/null || true
+                cp /etc/ntp.conf /etc/ntp.conf.bak 2>/dev/null || true
             fi
 
             {
                 echo "# Auto-generated by vps-time-sync"
                 echo "driftfile /var/lib/ntp/drift"
                 echo "restrict default kod nomodify notrap nopeer noquery"
-                echo "restrict -6 default kod nomodify notrap nopeer noquery"
                 echo "restrict 127.0.0.1"
-                echo "restrict -6 ::1"
                 echo ""
                 echo "server ${ntp_primary} iburst prefer"
                 echo "server ${ntp_secondary} iburst"
                 echo "server ${ntp_tertiary} iburst"
             } > /etc/ntp.conf
 
-            log_ok "NTP 配置已写入: /etc/ntp.conf"
+            log_ok "配置已写入: /etc/ntp.conf"
             systemctl enable ntpd 2>/dev/null || true
-            systemctl restart ntpd 2>/dev/null || true
+            systemctl start ntpd 2>/dev/null || true
             log_info "等待 NTPD 同步（5秒）..."
             sleep 5
             sync_ok=true
 
             echo ""
-            log_info "NTP peers 状态:"
+            log_info "NTP peers:"
+            echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
             ntpq -p 2>/dev/null | while IFS= read -r line; do
-                echo -e "         ${line}"
+                echo -e "  $line"
             done
-            ;;
-
-        ntpdate)
-            log_info "使用 ntpdate 单次同步..."
-            if ntpdate -b "$ntp_primary" 2>/dev/null; then
-                sync_ok=true
-                log_ok "ntpdate 同步成功 (${ntp_primary})"
-            elif ntpdate -b "$ntp_secondary" 2>/dev/null; then
-                sync_ok=true
-                log_ok "ntpdate 同步成功 (${ntp_secondary})"
-            fi
-            ;;
-
-        sntp)
-            log_info "使用 sntp 同步..."
-            if sntp -S "$ntp_primary" 2>/dev/null; then
-                sync_ok=true
-                log_ok "sntp 同步成功 (${ntp_primary})"
-            fi
+            echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
             ;;
 
         http)
-            log_warn "未检测到NTP工具，使用HTTP方式同步..."
+            # 纯HTTP方式同步
+            log_warn "使用HTTP方式获取时间（精度较低）..."
+            local http_date=""
+            for url in "https://www.google.com" "https://www.cloudflare.com" "https://www.baidu.com"; do
+                http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
+                if [[ -n "$http_date" ]]; then
+                    log_info "获取到HTTP时间: ${http_date} (来源: ${url})"
+                    if date -s "$http_date" >/dev/null 2>&1; then
+                        sync_ok=true
+                        log_ok "HTTP时间同步成功"
+                        break
+                    else
+                        log_warn "date -s 设置失败，尝试下一个源..."
+                    fi
+                fi
+            done
             ;;
     esac
 
-    # ---- 备用HTTP同步 ----
-    if [[ "$sync_ok" != "true" ]]; then
-        log_warn "NTP同步失败或不可用，尝试HTTP时间同步..."
+    # ---- 如果NTP方式全部失败，HTTP兜底 ----
+    if [[ "$sync_ok" != "true" ]] && [[ "$sync_tool" != "http" ]]; then
+        echo ""
+        log_warn "NTP同步未成功，尝试HTTP方式兜底..."
         local http_date=""
         for url in "https://www.google.com" "https://www.cloudflare.com" "https://www.baidu.com"; do
             http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
             if [[ -n "$http_date" ]]; then
+                log_info "HTTP时间: ${http_date}"
                 if date -s "$http_date" >/dev/null 2>&1; then
                     sync_ok=true
-                    log_ok "HTTP时间同步成功 (来源: ${url})"
+                    log_ok "HTTP兜底同步成功 (${url})"
                     break
                 fi
             fi
@@ -439,20 +523,25 @@ stage_sync_time() {
     fi
 
     # ---- 写入硬件时钟 ----
+    echo ""
     if command -v hwclock &>/dev/null; then
         hwclock --systohc 2>/dev/null || true
-        log_info "已同步到硬件时钟"
+        log_info "已写入硬件时钟"
     fi
 
-    echo ""
+    # ---- 同步结果 ----
     local time_after
     time_after=$(date '+%Y-%m-%d %H:%M:%S')
-    log_info "同步后时间: ${GREEN}${time_after}${NC}"
+    echo ""
+    log_info "同步前: ${YELLOW}${time_before}${NC}"
+    log_info "同步后: ${GREEN}${time_after}${NC}"
+    echo ""
 
     if [[ "$sync_ok" == "true" ]]; then
         log_ok "时间同步完成！"
     else
-        log_error "时间同步失败，请手动检查网络"
+        log_error "时间同步失败，请手动检查网络连接"
+        log_info "手动同步命令: ntpdate -b pool.ntp.org"
     fi
     echo ""
 }
@@ -490,8 +579,8 @@ stage_show_result() {
     echo -e "     UTC时间:     ${GREEN}$(date -u '+%Y-%m-%d %H:%M:%S UTC')${NC}"
     echo -e "     星期:        ${GREEN}$(date '+%A')${NC}"
 
-    echo ""
     if command -v timedatectl &>/dev/null; then
+        echo ""
         echo -e "  ${YELLOW}[timedatectl 状态]${NC}"
         timedatectl status 2>/dev/null | while IFS= read -r line; do
             echo -e "     ${line}"
@@ -504,7 +593,7 @@ stage_show_result() {
     echo -e "  ${GREEN}+----------------------------------------------------------+${NC}"
 
     echo ""
-    echo -e "  ${CYAN}[后续命令提示]${NC}"
+    echo -e "  ${CYAN}[后续命令]${NC}"
     echo "     查看时区:     timedatectl"
     echo "     Chrony状态:   chronyc tracking"
     echo "     Chrony源:     chronyc sources -v"
@@ -523,14 +612,12 @@ main() {
     echo -e "${CYAN}      Auto Timezone & Time Calibration${NC}"
     separator
 
-    # 检查root权限
     if [[ $EUID -ne 0 ]]; then
         echo ""
-        log_warn "建议使用 root 权限运行: sudo bash $0"
-        echo ""
+        log_error "请使用 root 权限运行: sudo bash $0"
+        exit 1
     fi
 
-    # 四个阶段按顺序执行
     stage_get_info
     stage_set_timezone
     stage_sync_time
