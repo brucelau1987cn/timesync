@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VPS 时区自动校准脚本 v2.3
+# VPS 时区自动校准脚本 v2.4
 # 根据公网 IP 归属地自动识别所在时区并完成校准
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
 # 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
@@ -8,10 +8,9 @@
 
 set -euo pipefail
 
-# ---------- 意外退出捕获（调试用） ----------
 trap 'echo -e "\033[0;31m[FATAL]\033[0m 脚本在第 $LINENO 行意外退出（退出码: $?）" >&2' EXIT
 
-# ---------- 颜色输出（全部输出到 stderr，避免污染命令替换） ----------
+# ---------- 颜色输出 ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${RESET}  $*" >&2; }
@@ -32,8 +31,7 @@ while [[ $# -gt 0 ]]; do
       echo "用法: $0 [--dry-run] [--force TIMEZONE]"
       echo "  --dry-run          仅检测，不修改系统"
       echo "  --force TIMEZONE   强制使用指定时区，例如 Asia/Tokyo"
-      trap - EXIT
-      exit 0 ;;
+      trap - EXIT; exit 0 ;;
     *) die "未知参数: $1，使用 --help 查看帮助" ;;
   esac
 done
@@ -166,10 +164,10 @@ apply_timezone() {
 }
 
 # =========================================================================
-# 从这里开始关闭 set -e，因为时间同步和结果展示中有太多可能返回非零的命令
+# 关闭 set -e，进入时间同步 + 报告阶段
 # =========================================================================
 sync_and_report() {
-  set +e   # ★ 彻底关闭 errexit，防止任何意外退出
+  set +e
   set +o pipefail
 
   local target_tz="$1"
@@ -180,61 +178,174 @@ sync_and_report() {
     info "[dry-run] 将执行网络时间同步"
   else
     info "正在同步网络时间..."
+    local tried_any=false
 
-    # ---- chrony ----
+    # ---- 1. chrony（已安装） ----
     if command -v chronyc &>/dev/null; then
+      tried_any=true
       info "检测到 chrony，尝试同步..."
+      # 确保 chronyd 在运行
+      systemctl start chronyd 2>/dev/null || service chronyd start 2>/dev/null || true
+      sleep 1
       if chronyc makestep &>/dev/null; then
         sync_ok=true
         sync_method="chrony"
         success "chrony 时间同步完成"
       else
-        warn "chronyc makestep 失败（chronyd 可能未运行），尝试其他方式..."
+        warn "chronyc makestep 失败"
       fi
     fi
 
-    # ---- ntpdate ----
+    # ---- 2. ntpdate（已安装） ----
     if ! $sync_ok && command -v ntpdate &>/dev/null; then
+      tried_any=true
       info "检测到 ntpdate，尝试同步..."
       if ntpdate -u pool.ntp.org &>/dev/null; then
         sync_ok=true
         sync_method="ntpdate"
         success "ntpdate 时间同步完成"
       else
-        warn "ntpdate 执行失败，尝试其他方式..."
+        warn "ntpdate 执行失败"
       fi
     fi
 
-    # ---- systemd-timesyncd ----
+    # ---- 3. systemd-timesyncd（检查是否真正可用） ----
     if ! $sync_ok && command -v timedatectl &>/dev/null; then
-      info "检测到 systemd-timesyncd，尝试同步..."
-      timedatectl set-ntp true 2>/dev/null
-      local i=1
-      while [ "$i" -le 10 ]; do
-        sleep 1
-        local ntp_status
-        ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "")
-        if [ "$ntp_status" = "yes" ]; then
-          sync_ok=true
-          sync_method="systemd-timesyncd（等待 ${i} 秒）"
-          success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
-          break
+      # 检查 NTP service 是否为 n/a（表示没有 NTP 后端）
+      local ntp_svc
+      ntp_svc=$(timedatectl status 2>/dev/null | grep -i "NTP service" || true)
+      if echo "$ntp_svc" | grep -qi "n/a"; then
+        warn "systemd-timesyncd 未安装（NTP service: n/a）"
+      else
+        tried_any=true
+        info "检测到 systemd-timesyncd，尝试同步..."
+        timedatectl set-ntp true 2>/dev/null
+        local i=1
+        while [ "$i" -le 15 ]; do
+          sleep 1
+          local ntp_status
+          ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "")
+          if [ "$ntp_status" = "yes" ]; then
+            sync_ok=true
+            sync_method="systemd-timesyncd（等待 ${i} 秒）"
+            success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
+            break
+          fi
+          i=$((i + 1))
+        done
+        if ! $sync_ok; then
+          warn "systemd-timesyncd 同步等待超时（15 秒）"
         fi
-        i=$((i + 1))
-      done
-      if ! $sync_ok; then
-        warn "systemd-timesyncd 同步等待超时（10秒），时间可能仍有偏差"
       fi
     fi
 
-    # ---- 全部失败 ----
-    if ! $sync_ok && [ -z "$sync_method" ]; then
-      warn "未找到可用的时间同步工具（chrony / ntpdate / systemd-timesyncd）"
-      warn "建议安装: apt install chrony 或 yum install chrony"
+    # ---- 4. 没有可用 NTP 工具 → 自动安装 chrony ----
+    if ! $sync_ok; then
+      info "没有可用的 NTP 同步工具，尝试自动安装 chrony..."
+      local install_ok=false
+
+      if command -v apt-get &>/dev/null; then
+        info "使用 apt-get 安装 chrony..."
+        apt-get update -qq 2>/dev/null
+        if apt-get install -y -qq chrony 2>/dev/null; then
+          install_ok=true
+        fi
+      elif command -v yum &>/dev/null; then
+        info "使用 yum 安装 chrony..."
+        if yum install -y -q chrony 2>/dev/null; then
+          install_ok=true
+        fi
+      elif command -v dnf &>/dev/null; then
+        info "使用 dnf 安装 chrony..."
+        if dnf install -y -q chrony 2>/dev/null; then
+          install_ok=true
+        fi
+      elif command -v apk &>/dev/null; then
+        info "使用 apk 安装 chrony..."
+        if apk add --quiet chrony 2>/dev/null; then
+          install_ok=true
+        fi
+      elif command -v pacman &>/dev/null; then
+        info "使用 pacman 安装 chrony..."
+        if pacman -Sy --noconfirm chrony 2>/dev/null; then
+          install_ok=true
+        fi
+      fi
+
+      if $install_ok && command -v chronyc &>/dev/null; then
+        success "chrony 安装成功"
+        # 启动 chronyd
+        systemctl enable --now chronyd 2>/dev/null \
+          || service chronyd start 2>/dev/null \
+          || chronyd 2>/dev/null \
+          || true
+        info "等待 chrony 同步..."
+        sleep 3
+        if chronyc makestep &>/dev/null; then
+          sync_ok=true
+          sync_method="chrony（自动安装）"
+          success "chrony 时间同步完成"
+        else
+          warn "chrony 已安装但 makestep 失败，尝试等待自动同步..."
+          sleep 5
+          # 检查偏差
+          local offset
+          offset=$(chronyc tracking 2>/dev/null | grep "System time" | grep -oP '[\d.]+' | head -1 || echo "")
+          if [ -n "$offset" ]; then
+            info "当前时钟偏差: ${offset} 秒"
+            sync_ok=true
+            sync_method="chrony（自动安装，偏差 ${offset}s）"
+          fi
+        fi
+      else
+        warn "chrony 自动安装失败"
+      fi
+    fi
+
+    # ---- 5. 终极回退：用 HTTP 响应头 date -s 强制校时 ----
+    if ! $sync_ok; then
+      info "尝试通过 HTTP 响应头校准系统时间（最后手段）..."
+      local http_date=""
+      if command -v curl &>/dev/null; then
+        http_date=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
+          | grep -i "^date:" | sed 's/^[Dd]ate: *//' | tr -d '\r')
+      fi
+      if [ -z "$http_date" ] && command -v wget &>/dev/null; then
+        http_date=$(wget -qS --spider --timeout=5 "https://www.google.com" 2>&1 \
+          | grep -i "Date:" | head -1 | sed 's/.*Date: *//' | tr -d '\r')
+      fi
+
+      if [ -n "$http_date" ]; then
+        info "HTTP 服务器时间: ${http_date}"
+        if date -s "$http_date" &>/dev/null; then
+          sync_ok=true
+          sync_method="HTTP 响应头（date -s）"
+          success "已通过 HTTP 响应头校准系统时间"
+        else
+          # 某些 busybox 的 date -s 格式不同，尝试转换
+          local epoch
+          epoch=$(date -d "$http_date" +%s 2>/dev/null || true)
+          if [ -n "$epoch" ]; then
+            date -s "@${epoch}" &>/dev/null
+            sync_ok=true
+            sync_method="HTTP 响应头（epoch）"
+            success "已通过 HTTP 响应头校准系统时间"
+          else
+            warn "HTTP 时间格式无法解析"
+          fi
+        fi
+      else
+        warn "无法获取 HTTP 服务器时间"
+      fi
+    fi
+
+    # ---- 同步后写入硬件时钟 ----
+    if $sync_ok && command -v hwclock &>/dev/null; then
+      hwclock -w 2>/dev/null && info "已同步写入硬件时钟（RTC）" || true
     fi
   fi
 
-  # ---------- 输出校准结果 ----------
+  # ==================== 结果汇总 ====================
   echo "" >&2
   echo -e "${BOLD}============================================${RESET}" >&2
   echo -e "${BOLD}           时区校准结果汇总${RESET}" >&2
@@ -242,16 +353,20 @@ sync_and_report() {
   echo -e "  校准时区  : ${GREEN}${target_tz}${RESET}" >&2
 
   if ! $DRY_RUN; then
-    echo -e "  本地时间  : ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${RESET}" >&2
-    echo -e "  UTC 时间  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >&2
+    local local_time utc_time
+    local_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    utc_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+    echo -e "  本地时间  : ${GREEN}${local_time}${RESET}" >&2
+    echo -e "  UTC 时间  : ${utc_time}" >&2
 
     if $sync_ok; then
       echo -e "  同步状态  : ${GREEN}✔ 已同步（${sync_method}）${RESET}" >&2
     else
-      echo -e "  同步状态  : ${YELLOW}✘ 未同步或超时${RESET}" >&2
+      echo -e "  同步状态  : ${YELLOW}✘ 未同步${RESET}" >&2
     fi
 
-    # 获取网络参考时间（通过 HTTP 响应头）
+    # 获取网络参考时间用于对比
     local net_time=""
     if command -v curl &>/dev/null; then
       net_time=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
@@ -261,14 +376,37 @@ sync_and_report() {
       net_time=$(wget -qS --spider --timeout=5 "https://www.google.com" 2>&1 \
         | grep -i "Date:" | head -1 | sed 's/.*Date: *//' | tr -d '\r')
     fi
+
     if [ -n "$net_time" ]; then
-      echo -e "  网络时间  : ${CYAN}${net_time}${RESET}" >&2
+      # 计算偏差秒数
+      local net_epoch local_epoch diff_sec=""
+      net_epoch=$(date -d "$net_time" +%s 2>/dev/null || true)
+      local_epoch=$(date +%s 2>/dev/null || true)
+      if [ -n "$net_epoch" ] && [ -n "$local_epoch" ]; then
+        diff_sec=$((local_epoch - net_epoch))
+        # 取绝对值
+        if [ "$diff_sec" -lt 0 ] 2>/dev/null; then
+          diff_sec=$(( -diff_sec ))
+        fi
+      fi
+
+      echo -e "  网络参考  : ${CYAN}${net_time}${RESET}" >&2
+      if [ -n "$diff_sec" ]; then
+        if [ "$diff_sec" -le 2 ]; then
+          echo -e "  时间偏差  : ${GREEN}≤ ${diff_sec} 秒（精准）${RESET}" >&2
+        elif [ "$diff_sec" -le 10 ]; then
+          echo -e "  时间偏差  : ${YELLOW}约 ${diff_sec} 秒（可接受）${RESET}" >&2
+        else
+          echo -e "  时间偏差  : ${RED}约 ${diff_sec} 秒（偏差较大）${RESET}" >&2
+        fi
+      fi
     fi
+
+    echo -e "${BOLD}--------------------------------------------${RESET}" >&2
 
     # timedatectl 详情
     if command -v timedatectl &>/dev/null; then
-      echo "" >&2
-      echo -e "  ${BOLD}[ timedatectl 详情 ]${RESET}" >&2
+      echo -e "  ${BOLD}[ timedatectl 状态 ]${RESET}" >&2
       timedatectl status 2>/dev/null | while IFS= read -r line; do
         echo "    $line" >&2
       done
@@ -283,7 +421,7 @@ sync_and_report() {
 # ---------- 主流程 ----------
 main() {
   echo "" >&2
-  echo -e "${BOLD}========== VPS 时区自动校准脚本 v2.3 ==========${RESET}" >&2
+  echo -e "${BOLD}========== VPS 时区自动校准脚本 v2.4 ==========${RESET}" >&2
   $DRY_RUN && warn "dry-run 模式：仅检测，不修改系统"
   echo "" >&2
 
@@ -298,7 +436,6 @@ main() {
 
   info "目标时区: ${target_tz}"
 
-  # 获取当前时区（每步 || true）
   local current_tz=""
   current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
   [[ -z "$current_tz" ]] && current_tz=$(cat /etc/timezone 2>/dev/null || true)
@@ -312,10 +449,8 @@ main() {
     apply_timezone "$target_tz"
   fi
 
-  # ★ 时间同步 + 结果展示（内部已关闭 set -e）
   sync_and_report "$target_tz"
 
-  # 正常退出，清除 trap
   trap - EXIT
   exit 0
 }
