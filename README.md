@@ -32,7 +32,7 @@
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-calibrate/main/tz-chronyd.sh)
-
+```
 
 ## 后续常用命令
 
@@ -48,3 +48,4 @@ chronyc sources -v
 
 # 手动强制同步一次
 chronyc makestep
+```
