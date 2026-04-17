@@ -133,7 +133,7 @@ echo ""
 if [[ ${#TIMESTAMPS[@]} -eq 0 ]]; then
     echo -e "${RED}  未能从任何网站获取时间，跳过HTTP时间同步${NC}"
 else
-    # 取中位数，防止异常值
+    # 取中位数防止异常值
     IFS=$'\n' SORTED=($(sort -n <<<"${TIMESTAMPS[*]}")); unset IFS
     MID=$(( ${#SORTED[@]} / 2 ))
     MEDIAN_EPOCH="${SORTED[$MID]}"
@@ -143,7 +143,6 @@ else
     echo -e "  当前系统时间: ${YELLOW}${CURRENT_TIME}${NC}"
     echo -e "  网络参考时间: ${GREEN}${NETWORK_TIME}${NC}"
 
-    # 计算偏差
     LOCAL_EPOCH=$(date +%s)
     DIFF=$(( MEDIAN_EPOCH - LOCAL_EPOCH ))
     ABS_DIFF=${DIFF#-}
@@ -152,11 +151,9 @@ else
         echo -e "  ${GREEN}系统时间与网络时间偏差 ≤2秒，无需校准${NC}"
     else
         echo -e "  ${YELLOW}偏差 ${ABS_DIFF} 秒，正在写入网络时间...${NC}"
-        # 尝试关闭NTP后设置
         timedatectl set-ntp false 2>/dev/null
         date -s "@$MEDIAN_EPOCH" &>/dev/null
         if [[ $? -eq 0 ]]; then
-            # 同步到硬件时钟
             hwclock --systohc 2>/dev/null
             echo -e "  ${GREEN}✔ 系统时间已校准为: $(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
         else
@@ -170,57 +167,12 @@ echo ""
 # ============================================================
 # 第三步：选择NTP校准工具保持长期同步
 # ============================================================
-echo -e "${GREEN}[3/3] 选择 NTP 时间同步工具（保持长期自动校准）${NC}"
+echo -e "${GREEN}[3/3] 配置 NTP 时间同步工具（保持长期自动校准）${NC}"
 echo ""
 
-# 检测安装状态
-check_installed() {
-    if command -v "$1" &>/dev/null; then
-        echo -e "${GREEN}已安装${NC}"
-        return 0
-    else
-        echo -e "${RED}未安装${NC}"
-        return 1
-    fi
-}
-
-CHRONY_STATUS=$(check_installed chronyd)
-NTPDATE_STATUS=$(check_installed ntpdate)
-# timesyncd 是 systemd 内置服务
-if systemctl list-unit-files 2>/dev/null | grep -q "systemd-timesyncd"; then
-    TIMESYNCD_STATUS=$(echo -e "${GREEN}已安装${NC}")
-    TIMESYNCD_EXIST=1
-else
-    TIMESYNCD_STATUS=$(echo -e "${RED}未安装${NC}")
-    TIMESYNCD_EXIST=0
-fi
-
-echo -e "${CYAN}┌──────────────────────────────────────────────────────────────────┐${NC}"
-echo -e "${CYAN}│  序号  │  工具名称           │  状态     │  说明               │${NC}"
-echo -e "${CYAN}├──────────────────────────────────────────────────────────────────┤${NC}"
-echo -e "${CYAN}│${NC}  [1]   │  chrony (chronyd)   │  $CHRONY_STATUS  │  ${YELLOW}推荐${NC}               ${CYAN}│${NC}"
-echo -e "${CYAN}│${NC}  [2]   │  ntpdate            │  $NTPDATE_STATUS  │  传统一次性同步     ${CYAN}│${NC}"
-echo -e "${CYAN}│${NC}  [3]   │  systemd-timesyncd  │  $TIMESYNCD_STATUS  │  systemd 内置轻量   ${CYAN}│${NC}"
-echo -e "${CYAN}│${NC}  [0]   │  跳过               │          │  不配置NTP          ${CYAN}│${NC}"
-echo -e "${CYAN}└──────────────────────────────────────────────────────────────────┘${NC}"
-echo ""
-echo -e "${YELLOW}三者区别说明：${NC}"
-echo -e "  ${GREEN}chrony${NC}:    现代NTP实现，启动后快速收敛，支持间歇性网络连接，适合"
-echo -e "             虚拟机/VPS/容器环境。能在大时间偏移下快速纠正，精度高。"
-echo -e "             持续后台运行，自动保持同步。${YELLOW}【首选推荐】${NC}"
-echo ""
-echo -e "  ${GREEN}ntpdate${NC}:   传统的一次性时间同步命令，执行一次校准一次，不驻留后台。"
-echo -e "             需配合 crontab 定时任务才能持续校准。许多新发行版已弃用。"
-echo -e "             适合临时快速校准或极简环境。"
-echo ""
-echo -e "  ${GREEN}systemd-timesyncd${NC}: systemd 自带的轻量级 SNTP 客户端，开箱即用。"
-echo -e "             功能较简单，仅作为客户端同步，不能作为NTP服务器。"
-echo -e "             适合对精度要求不高、希望零配置的场景。"
-echo ""
-
-read -rp "请选择 [0-3] (默认1): " CHOICE
-CHOICE=${CHOICE:-1}
-
+# ——————————————————————————————————————
+# 公共NTP源
+# ——————————————————————————————————————
 NTP_SERVERS=(
     "time.cloudflare.com"
     "time.apple.com"
@@ -230,63 +182,38 @@ NTP_SERVERS=(
     "pool.ntp.org"
 )
 
-case "$CHOICE" in
-1)
-    echo ""
-    echo -e "${GREEN}正在配置 chrony...${NC}"
-
-    # 停止冲突服务
+# ——————————————————————————————————————
+# chrony 配置函数
+# ——————————————————————————————————————
+setup_chrony() {
     systemctl stop systemd-timesyncd 2>/dev/null
     systemctl disable systemd-timesyncd 2>/dev/null
     systemctl stop ntpd 2>/dev/null
     systemctl disable ntpd 2>/dev/null
 
     if ! command -v chronyd &>/dev/null; then
-        if [[ "$PKG" == "apt-get" ]]; then
-            install_pkg chrony
-        elif [[ "$PKG" == "pacman" ]]; then
-            install_pkg chrony
-        else
-            install_pkg chrony
-        fi
+        install_pkg chrony
     fi
 
-    # 查找配置文件
     CHRONY_CONF=""
     for f in /etc/chrony/chrony.conf /etc/chrony.conf; do
         [[ -f "$f" ]] && CHRONY_CONF="$f" && break
     done
+    [[ -z "$CHRONY_CONF" ]] && CHRONY_CONF="/etc/chrony.conf" && touch "$CHRONY_CONF"
 
-    if [[ -z "$CHRONY_CONF" ]]; then
-        CHRONY_CONF="/etc/chrony.conf"
-        touch "$CHRONY_CONF"
-    fi
-
-    # 备份
     cp "$CHRONY_CONF" "${CHRONY_CONF}.bak.$(date +%s)"
 
-    # 写入新配置
     cat > "$CHRONY_CONF" <<EOF
 # Chrony NTP 配置 - 自动生成 $(date '+%Y-%m-%d %H:%M:%S')
-
-# NTP 服务器
 server time.cloudflare.com iburst
 server time.apple.com iburst
 server time.google.com iburst
 server ntp.aliyun.com iburst
 server ntp.tencent.com iburst
 pool pool.ntp.org iburst
-
-# 允许大幅度时间跳跃（前3次同步，偏差>1秒时步进）
 makestep 1 3
-
-# 记录时钟漂移
 driftfile /var/lib/chrony/drift
-
-# 日志
 logdir /var/log/chrony
-
-# 开启RTC同步
 rtcsync
 EOF
 
@@ -300,17 +227,16 @@ EOF
     chronyc tracking 2>/dev/null
     echo ""
     chronyc sources -v 2>/dev/null
-    ;;
+}
 
-2)
-    echo ""
-    echo -e "${GREEN}正在配置 ntpdate...${NC}"
-
+# ——————————————————————————————————————
+# ntpdate 配置函数
+# ——————————————————————————————————————
+setup_ntpdate() {
     if ! command -v ntpdate &>/dev/null; then
         install_pkg ntpdate
     fi
 
-    # 停止冲突服务
     systemctl stop chronyd 2>/dev/null
     systemctl stop systemd-timesyncd 2>/dev/null
     timedatectl set-ntp false 2>/dev/null
@@ -333,19 +259,17 @@ EOF
         echo -e "  ${GREEN}✔ 已同步到硬件时钟${NC}"
     fi
 
-    # 设置定时任务
     CRON_CMD="0 */6 * * * /usr/sbin/ntpdate -u time.cloudflare.com > /dev/null 2>&1"
     (crontab -l 2>/dev/null | grep -v "ntpdate"; echo "$CRON_CMD") | crontab -
     echo ""
     echo -e "${GREEN}✔ 已添加 crontab 定时任务（每6小时同步一次）${NC}"
     echo -e "  ${CYAN}${CRON_CMD}${NC}"
-    ;;
+}
 
-3)
-    echo ""
-    echo -e "${GREEN}正在配置 systemd-timesyncd...${NC}"
-
-    # 停止冲突服务
+# ——————————————————————————————————————
+# timesyncd 配置函数
+# ——————————————————————————————————————
+setup_timesyncd() {
     systemctl stop chronyd 2>/dev/null
     systemctl disable chronyd 2>/dev/null
 
@@ -353,8 +277,6 @@ EOF
         install_pkg systemd-timesyncd
     fi
 
-    # 配置NTP服务器
-    mkdir -p /etc/systemd/
     TIMESYNCD_CONF="/etc/systemd/timesyncd.conf"
     cp "$TIMESYNCD_CONF" "${TIMESYNCD_CONF}.bak.$(date +%s)" 2>/dev/null
 
@@ -374,16 +296,84 @@ EOF
     echo ""
     echo -e "${CYAN}同步状态：${NC}"
     timedatectl timesync-status 2>/dev/null || timedatectl status 2>/dev/null
-    ;;
+}
 
-0)
-    echo -e "${YELLOW}已跳过NTP工具配置${NC}"
-    ;;
+# ——————————————————————————————————————
+# 核心判断：chrony 已安装则直接使用，否则让用户选择
+# ——————————————————————————————————————
+if command -v chronyd &>/dev/null; then
+    echo -e "  ${GREEN}✔ 检测到 chrony 已安装，直接使用 chrony 进行时间同步（跳过选择）${NC}"
+    echo ""
+    setup_chrony
+else
+    # 检测其余工具安装状态
+    NTPDATE_INSTALLED=0
+    TIMESYNCD_INSTALLED=0
+    command -v ntpdate &>/dev/null && NTPDATE_INSTALLED=1
+    systemctl list-unit-files 2>/dev/null | grep -q "systemd-timesyncd" && TIMESYNCD_INSTALLED=1
 
-*)
-    echo -e "${RED}无效选择，已跳过${NC}"
-    ;;
-esac
+    if [[ $NTPDATE_INSTALLED -eq 1 ]]; then
+        NTPDATE_TAG="${GREEN}已安装${NC}"
+    else
+        NTPDATE_TAG="${RED}未安装${NC}"
+    fi
+    if [[ $TIMESYNCD_INSTALLED -eq 1 ]]; then
+        TIMESYNCD_TAG="${GREEN}已安装${NC}"
+    else
+        TIMESYNCD_TAG="${RED}未安装${NC}"
+    fi
+
+    echo -e "  chrony:            ${RED}未安装${NC}"
+    echo -e "  ntpdate:           $NTPDATE_TAG"
+    echo -e "  systemd-timesyncd: $TIMESYNCD_TAG"
+    echo ""
+    echo -e "${CYAN}┌────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│  序号  │  工具名称           │  说明                              │${NC}"
+    echo -e "${CYAN}├────────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC}  [1]   │  chrony (chronyd)   │  ${YELLOW}推荐${NC} 现代NTP，快速收敛，精度高     ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  [2]   │  ntpdate            │  传统一次性同步，需配合crontab      ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  [3]   │  systemd-timesyncd  │  systemd内置轻量SNTP客户端          ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  [0]   │  跳过               │  不配置NTP                         ${CYAN}│${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${YELLOW}三者区别说明：${NC}"
+    echo -e "  ${GREEN}chrony${NC}:    现代NTP实现，启动后快速收敛，支持间歇性网络连接，适合"
+    echo -e "             虚拟机/VPS/容器。能在大偏移下快速纠正，精度高，持续后台"
+    echo -e "             运行自动保持同步。${YELLOW}【首选推荐】${NC}"
+    echo ""
+    echo -e "  ${GREEN}ntpdate${NC}:   传统一次性时间同步命令，执行一次校准一次，不驻留后台。"
+    echo -e "             需配合 crontab 定时任务才能持续校准。许多新发行版已弃用。"
+    echo -e "             适合临时快速校准或极简环境。"
+    echo ""
+    echo -e "  ${GREEN}systemd-timesyncd${NC}: systemd 自带轻量级 SNTP 客户端，开箱即用。"
+    echo -e "             功能较简单，仅作为客户端同步，不能作为NTP服务器。"
+    echo -e "             适合对精度要求不高、希望零配置的场景。"
+    echo ""
+
+    read -rp "请选择 [0-3] (默认1): " CHOICE
+    CHOICE=${CHOICE:-1}
+
+    case "$CHOICE" in
+    1)
+        echo ""
+        setup_chrony
+        ;;
+    2)
+        echo ""
+        setup_ntpdate
+        ;;
+    3)
+        echo ""
+        setup_timesyncd
+        ;;
+    0)
+        echo -e "${YELLOW}已跳过NTP工具配置${NC}"
+        ;;
+    *)
+        echo -e "${RED}无效选择，已跳过${NC}"
+        ;;
+    esac
+fi
 
 echo ""
 echo -e "${CYAN}============================================${NC}"
