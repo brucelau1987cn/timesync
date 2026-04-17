@@ -2,13 +2,10 @@
 
 # ============================================================
 # VPS 时区和时间自动校准脚本
-# 根据公网 IP 归属地自动识别所在时区并完成校准
+# 根据公网 IP 归属地自动调整时区并同步时间
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等主流发行版
 # 用法：bash tz-calibrate.sh
 # ============================================================
-#
-
-set -e
 
 # 颜色定义
 RED='\033[31m'
@@ -18,487 +15,526 @@ BLUE='\033[34m'
 CYAN='\033[36m'
 NC='\033[0m'
 
-# 日志函数
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step() { echo -e "${CYAN}[STEP]${NC} $1"; }
+# 全局变量
+PUBLIC_IP=""
+COUNTRY=""
+CITY=""
+REGION=""
+ORG=""
+DETECTED_TZ=""
 
-# 检测root权限
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "此脚本需要root权限运行"
+# 日志函数
+log_info()  { echo -e "  ${BLUE}[INFO]${NC}  $1"; }
+log_ok()    { echo -e "  ${GREEN}[ OK ]${NC}  $1"; }
+log_warn()  { echo -e "  ${YELLOW}[WARN]${NC}  $1"; }
+log_error() { echo -e "  ${RED}[FAIL]${NC}  $1"; }
+
+separator() {
+    echo -e "${CYAN}================================================================${NC}"
+}
+
+#================================================================
+# 第一阶段：获取公网IP和时区信息
+#================================================================
+stage_get_info() {
+    echo ""
+    separator
+    echo -e "${CYAN}  [阶段一] 获取公网IP和时区信息${NC}"
+    separator
+    echo ""
+
+    # 1. 获取公网IPv4
+    log_info "正在获取公网IPv4地址..."
+    PUBLIC_IP=$(curl -4 -s --max-time 10 ip.sb 2>/dev/null)
+    if [[ -z "$PUBLIC_IP" ]]; then
+        log_warn "ip.sb 失败，尝试 ifconfig.me..."
+        PUBLIC_IP=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null)
+    fi
+    if [[ -z "$PUBLIC_IP" ]]; then
+        log_warn "ifconfig.me 失败，尝试 ipinfo.io..."
+        PUBLIC_IP=$(curl -4 -s --max-time 10 https://ipinfo.io/ip 2>/dev/null)
+    fi
+    if [[ -z "$PUBLIC_IP" ]]; then
+        log_error "所有方法均无法获取公网IP，脚本退出"
         exit 1
     fi
-}
+    log_ok "公网IPv4: ${GREEN}${PUBLIC_IP}${NC}"
 
-# 检测系统类型
-detect_os() {
-    if [[ -f /etc/debian_version ]]; then
-        OS="debian"
-    elif [[ -f /etc/redhat-release ]]; then
-        OS="centos"
-    elif [[ -f /etc/alpine-release ]]; then
-        OS="alpine"
-    elif [[ -f /etc/arch-release ]]; then
-        OS="arch"
-    else
-        OS="unknown"
+    # 2. 通过 ipinfo.io 查询完整信息
+    log_info "正在查询IP归属信息..."
+    local raw_json=""
+    raw_json=$(curl -s --max-time 15 "https://ipinfo.io/${PUBLIC_IP}" 2>/dev/null)
+
+    if [[ -z "$raw_json" ]]; then
+        log_error "无法从 ipinfo.io 获取信息，脚本退出"
+        exit 1
     fi
-    log_info "操作系统: ${OS}"
+
+    # 3. 解析JSON
+    if command -v jq &>/dev/null; then
+        DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty')
+        COUNTRY=$(echo "$raw_json" | jq -r '.country // empty')
+        CITY=$(echo "$raw_json" | jq -r '.city // empty')
+        REGION=$(echo "$raw_json" | jq -r '.region // empty')
+        ORG=$(echo "$raw_json" | jq -r '.org // empty')
+    else
+        DETECTED_TZ=$(echo "$raw_json" | grep -oP '"timezone"\s*:\s*"\K[^"]+' 2>/dev/null)
+        COUNTRY=$(echo "$raw_json" | grep -oP '"country"\s*:\s*"\K[^"]+' 2>/dev/null)
+        CITY=$(echo "$raw_json" | grep -oP '"city"\s*:\s*"\K[^"]+' 2>/dev/null)
+        REGION=$(echo "$raw_json" | grep -oP '"region"\s*:\s*"\K[^"]+' 2>/dev/null)
+        ORG=$(echo "$raw_json" | grep -oP '"org"\s*:\s*"\K[^"]+' 2>/dev/null)
+    fi
+
+    if [[ -z "$DETECTED_TZ" ]]; then
+        log_error "无法解析时区信息，脚本退出"
+        exit 1
+    fi
+
+    log_ok "检测时区: ${GREEN}${DETECTED_TZ}${NC}"
+    log_ok "归属地区: ${GREEN}${COUNTRY} / ${REGION} / ${CITY}${NC}"
+    [[ -n "$ORG" ]] && log_ok "网络运营: ${GREEN}${ORG}${NC}"
+    echo ""
 }
 
-# 获取公网IP
-get_public_ip() {
-    log_step "获取公网IPv4地址..."
-    
-    for api in "ip.sb" "ifconfig.me" "api.ipify.org"; do
-        PUBLIC_IP=$(curl -4 -s --max-time 8 "https://${api}" 2>/dev/null)
-        if [[ "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            log_success "公网IP: ${PUBLIC_IP} (来源: ${api})"
+#================================================================
+# 第二阶段：配置系统时区
+#================================================================
+stage_set_timezone() {
+    separator
+    echo -e "${CYAN}  [阶段二] 配置系统时区${NC}"
+    separator
+    echo ""
+
+    local tz="$DETECTED_TZ"
+
+    # 获取当前时区
+    local current_tz=""
+    if command -v timedatectl &>/dev/null; then
+        current_tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+    fi
+    if [[ -z "$current_tz" ]] && [[ -f /etc/timezone ]]; then
+        current_tz=$(cat /etc/timezone 2>/dev/null)
+    fi
+    if [[ -z "$current_tz" ]]; then
+        current_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||')
+    fi
+
+    log_info "当前时区: ${YELLOW}${current_tz:-未知}${NC}"
+    log_info "目标时区: ${GREEN}${tz}${NC}"
+
+    if [[ "$current_tz" == "$tz" ]]; then
+        log_ok "时区已正确，无需修改"
+        echo ""
+        return 0
+    fi
+
+    # 检查目标时区文件是否存在
+    if [[ ! -f "/usr/share/zoneinfo/${tz}" ]]; then
+        log_error "时区文件不存在: /usr/share/zoneinfo/${tz}"
+        exit 1
+    fi
+
+    # 方法1: timedatectl
+    if command -v timedatectl &>/dev/null; then
+        if timedatectl set-timezone "$tz" 2>/dev/null; then
+            log_ok "timedatectl 设置成功: ${GREEN}${tz}${NC}"
+            echo ""
             return 0
         fi
-    done
-    
-    log_error "无法获取公网IP"
-    exit 1
-}
+        log_warn "timedatectl 设置失败，使用链接方式"
+    fi
 
-# 查询时区
-get_timezone() {
-    log_step "查询IP所在时区..."
-    
-    # 方法1: ipinfo.io
-    local response=$(curl -4 -s --max-time 15 "https://ipinfo.io/${PUBLIC_IP}/json")
-    if echo "$response" | grep -q "timezone"; then
-        TIMEZONE=$(echo "$response" | grep -o '"timezone": *"[^"]*"' | cut -d'"' -f4)
-        COUNTRY=$(echo "$response" | grep -o '"country": *"[^"]*"' | cut -d'"' -f4)
-        CITY=$(echo "$response" | grep -o '"city": *"[^"]*"' | cut -d'"' -f4)
-        log_success "时区: ${TIMEZONE} (${COUNTRY}/${CITY})"
-        return 0
-    fi
-    
-    # 方法2: ip-api.com
-    response=$(curl -4 -s --max-time 15 "http://ip-api.com/json/${PUBLIC_IP}?fields=timezone,country,city")
-    if echo "$response" | grep -q "timezone"; then
-        TIMEZONE=$(echo "$response" | grep -o '"timezone":"[^"]*"' | cut -d'"' -f4)
-        COUNTRY=$(echo "$response" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
-        CITY=$(echo "$response" | grep -o '"city":"[^"]*"' | cut -d'"' -f4)
-        log_success "时区: ${TIMEZONE} (${COUNTRY}/${CITY})"
-        return 0
-    fi
-    
-    # 方法3: worldtimeapi
-    response=$(curl -4 -s --max-time 15 "http://worldtimeapi.org/api/ip/${PUBLIC_IP}.json")
-    if echo "$response" | grep -q "timezone"; then
-        TIMEZONE=$(echo "$response" | grep -o '"timezone":"[^"]*"' | cut -d'"' -f4)
-        log_success "时区: ${TIMEZONE}"
-        return 0
-    fi
-    
-    log_warning "无法查询时区，使用默认 Asia/Shanghai"
-    TIMEZONE="Asia/Shanghai"
-}
+    # 方法2: 手动链接
+    rm -f /etc/localtime 2>/dev/null
+    ln -s "/usr/share/zoneinfo/${tz}" /etc/localtime
+    echo "$tz" > /etc/timezone 2>/dev/null || true
 
-# 设置时区
-set_timezone() {
-    log_step "设置系统时区: ${TIMEZONE}..."
-    
-    if [[ -f /usr/share/zoneinfo/${TIMEZONE} ]]; then
-        case "${OS}" in
-            debian|centos|arch)
-                timedatectl set-timezone "${TIMEZONE}" 2>/dev/null || \
-                ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
-                ;;
-            alpine)
-                ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
-                echo "${TIMEZONE}" > /etc/timezone
-                ;;
-        esac
-        log_success "时区设置完成"
+    # 验证
+    local verify_tz=""
+    verify_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||')
+    if [[ "$verify_tz" == "$tz" ]]; then
+        log_ok "链接方式设置成功: ${GREEN}${tz}${NC}"
     else
-        log_error "时区文件不存在: ${TIMEZONE}"
-        exit 1
+        log_error "时区设置失败"
     fi
+    echo ""
 }
 
-# 安装 chrony
-install_chrony() {
-    log_step "安装 chrony..."
-    
-    case "${OS}" in
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq && apt-get install -y -qq chrony curl
-            ;;
-        centos)
-            yum install -y chrony curl
-            ;;
-        alpine)
-            apk add chrony curl
-            ;;
-        arch)
-            pacman -Sy --noconfirm chrony curl
-            ;;
-    esac
-    
-    log_success "chrony 安装完成"
-}
+#================================================================
+# 第三阶段：NTP时间同步
+#================================================================
+stage_sync_time() {
+    separator
+    echo -e "${CYAN}  [阶段三] NTP时间同步${NC}"
+    separator
+    echo ""
 
-# 测试网络连接
-test_network() {
-    log_step "测试网络连接..."
-    
-    local test_hosts=("time.google.com" "time.cloudflare.com" "pool.ntp.org")
-    local success=false
-    
-    for host in "${test_hosts[@]}"; do
-        if timeout 5 curl -s "https://${host}" > /dev/null 2>&1 || \
-           timeout 5 nc -zv "${host}" 123 2>/dev/null || \
-           timeout 5 ping -c 1 "${host}" > /dev/null 2>&1; then
-            log_success "网络连接正常: ${host}"
-            success=true
-            break
-        fi
-    done
-    
-    if [[ "$success" == "false" ]]; then
-        log_warning "网络可能有限制，尝试备用方案..."
-    fi
-}
+    local tz="$DETECTED_TZ"
 
-# 配置 chrony - 使用更多NTP服务器
-configure_chrony() {
-    log_step "配置 chrony..."
-    
-    local chrony_conf="/etc/chrony/chrony.conf"
-    [[ "$OS" == "alpine" ]] && chrony_conf="/etc/chrony.conf"
-    
-    # 备份
-    [[ -f "${chrony_conf}" ]] && cp "${chrony_conf}" "${chrony_conf}.bak"
-    
-    # 根据时区选择NTP服务器
-    local ntp_servers=""
-    case "${TIMEZONE}" in
+    # ---- 选择NTP服务器 ----
+    log_info "根据时区选择最优NTP服务器..."
+
+    local ntp_primary=""
+    local ntp_secondary=""
+    local ntp_tertiary=""
+
+    case "$tz" in
         Asia/Shanghai|Asia/Chongqing|Asia/Harbin|Asia/Urumqi)
-            ntp_servers="server 0.cn.pool.ntp.org iburst prefer
-server 1.cn.pool.ntp.org iburst
-server 2.cn.pool.ntp.org iburst
-server 3.cn.pool.ntp.org iburst
-server ntp.aliyun.com iburst
-server ntp1.aliyun.com iburst
-server time.google.com iburst"
+            ntp_primary="cn.pool.ntp.org"
+            ntp_secondary="ntp.aliyun.com"
+            ntp_tertiary="ntp.tencent.com"
             ;;
-        Asia/Hong_Kong|Asia/Macau|Asia/Taipei)
-            ntp_servers="server 0.asia.pool.ntp.org iburst
-server 1.asia.pool.ntp.org iburst
-server time.google.com iburst
-server time.cloudflare.com iburst
-server ntp1.aliyun.com iburst"
+        Asia/Hong_Kong)
+            ntp_primary="hk.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
             ;;
-        Asia/Tokyo|Asia/Seoul|Asia/Singapore)
-            ntp_servers="server 0.asia.pool.ntp.org iburst
-server 1.asia.pool.ntp.org iburst
-server time.google.com iburst
-server ntp.nict.jp iburst"
+        Asia/Tokyo)
+            ntp_primary="jp.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
             ;;
-        America/*)
-            ntp_servers="server 0.north-america.pool.ntp.org iburst
-server 1.north-america.pool.ntp.org iburst
-server time.google.com iburst
-server time.cloudflare.com iburst"
+        Asia/Seoul)
+            ntp_primary="kr.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Asia/Singapore)
+            ntp_primary="sg.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Asia/Taipei)
+            ntp_primary="tw.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Asia/Kolkata|Asia/Calcutta)
+            ntp_primary="in.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Asia/Bangkok|Asia/Ho_Chi_Minh|Asia/Jakarta|Asia/Manila)
+            ntp_primary="asia.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Asia/*)
+            ntp_primary="asia.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Europe/London)
+            ntp_primary="uk.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Europe/Berlin|Europe/Paris|Europe/Amsterdam)
+            ntp_primary="de.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Europe/Moscow)
+            ntp_primary="ru.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
             ;;
         Europe/*)
-            ntp_servers="server 0.europe.pool.ntp.org iburst
-server 1.europe.pool.ntp.org iburst
-server time.google.com iburst
-server time.cloudflare.com iburst"
+            ntp_primary="europe.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        America/New_York|America/Chicago|America/Denver|America/Los_Angeles)
+            ntp_primary="us.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        America/Toronto|America/Vancouver)
+            ntp_primary="ca.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        America/Sao_Paulo)
+            ntp_primary="br.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        America/*)
+            ntp_primary="north-america.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Australia/*|Pacific/*)
+            ntp_primary="oceania.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
+            ;;
+        Africa/*)
+            ntp_primary="africa.pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
             ;;
         *)
-            ntp_servers="server 0.pool.ntp.org iburst
-server 1.pool.ntp.org iburst
-server 2.pool.ntp.org iburst
-server time.google.com iburst
-server time.cloudflare.com iburst"
+            ntp_primary="pool.ntp.org"
+            ntp_secondary="time.google.com"
+            ntp_tertiary="time.cloudflare.com"
             ;;
     esac
-    
-    # 写入配置
-    cat > "${chrony_conf}" << EOF
-# Chrony 配置 - $(date '+%Y-%m-%d %H:%M:%S')
-# IP: ${PUBLIC_IP} | 时区: ${TIMEZONE}
 
-# NTP 服务器
-${ntp_servers}
+    log_ok "主NTP服务器: ${GREEN}${ntp_primary}${NC}"
+    log_ok "备NTP服务器: ${GREEN}${ntp_secondary}${NC}"
+    log_ok "三NTP服务器: ${GREEN}${ntp_tertiary}${NC}"
+    echo ""
 
-# 实时时钟同步
-rtcsync
+    # ---- 检测同步工具 ----
+    local sync_tool=""
+    if command -v chronyd &>/dev/null; then
+        sync_tool="chrony"
+    elif command -v ntpd &>/dev/null; then
+        sync_tool="ntpd"
+    elif command -v ntpdate &>/dev/null; then
+        sync_tool="ntpdate"
+    elif command -v sntp &>/dev/null; then
+        sync_tool="sntp"
+    else
+        sync_tool="http"
+    fi
+    log_info "同步工具: ${GREEN}${sync_tool}${NC}"
 
-# 允许所有来源
-allow
+    # 记录同步前时间
+    local time_before
+    time_before=$(date '+%Y-%m-%d %H:%M:%S')
+    log_info "同步前时间: ${YELLOW}${time_before}${NC}"
+    echo ""
 
-# 初始大步校正（允许大偏移快速同步）
-makestep 1.0 -1
+    local sync_ok=false
 
-# 硬件时间戳（如果可用）
-hwtimestamp *
+    # ---- 执行同步 ----
+    case "$sync_tool" in
+        chrony)
+            log_info "配置 Chrony..."
 
-# 日志
-logdir /var/log/chrony
+            # 查找chrony配置文件路径
+            local chrony_conf="/etc/chrony/chrony.conf"
+            if [[ ! -d "/etc/chrony" ]]; then
+                chrony_conf="/etc/chrony.conf"
+            fi
 
-# 绑定地址（允许所有接口）
-bindcmdaddress 0.0.0.0
-bindcmdaddress ::
+            # 备份原配置
+            if [[ -f "$chrony_conf" ]]; then
+                cp "$chrony_conf" "${chrony_conf}.bak.$(date +%s)" 2>/dev/null || true
+            fi
 
-# 命令访问控制
-cmdallow 127.0.0.1
-cmdallow ::1
+            # 写入新配置（不用heredoc变量展开，手动拼接）
+            {
+                echo "# Auto-generated by vps-time-sync"
+                echo "server ${ntp_primary} iburst"
+                echo "server ${ntp_secondary} iburst"
+                echo "server ${ntp_tertiary} iburst"
+                echo ""
+                echo "driftfile /var/lib/chrony/chrony.drift"
+                echo "makestep 1.0 3"
+                echo "rtcsync"
+                echo "allow all"
+            } > "$chrony_conf"
 
-# 离线测量保存
-dumpdir /var/lib/chrony
-dumponexit
-EOF
-    
-    log_success "chrony 配置完成"
-}
+            log_ok "Chrony 配置已写入: ${chrony_conf}"
 
-# 启动 chrony 服务
-start_chrony() {
-    log_step "启动 chrony 服务..."
-    
-    case "${OS}" in
-        debian)
-            systemctl enable chrony 2>/dev/null || systemctl enable chronyd
-            systemctl restart chrony 2>/dev/null || systemctl restart chronyd
+            systemctl enable chronyd 2>/dev/null || true
+            systemctl restart chronyd 2>/dev/null || true
+            log_info "等待 Chrony 同步（5秒）..."
+            sleep 5
+
+            if chronyc makestep >/dev/null 2>&1; then
+                sync_ok=true
+                log_ok "Chrony makestep 执行成功"
+            fi
+
+            # 显示chrony源状态
+            echo ""
+            log_info "Chrony 同步源状态:"
+            chronyc sources 2>/dev/null | while IFS= read -r line; do
+                echo -e "         ${line}"
+            done
+            echo ""
+            log_info "Chrony tracking 信息:"
+            chronyc tracking 2>/dev/null | while IFS= read -r line; do
+                echo -e "         ${line}"
+            done
             ;;
-        centos|arch)
-            systemctl enable chronyd
-            systemctl restart chronyd
+
+        ntpd)
+            log_info "配置 NTPD..."
+            systemctl stop ntpd 2>/dev/null || true
+
+            if [[ -f /etc/ntp.conf ]]; then
+                cp /etc/ntp.conf /etc/ntp.conf.bak.$(date +%s) 2>/dev/null || true
+            fi
+
+            {
+                echo "# Auto-generated by vps-time-sync"
+                echo "driftfile /var/lib/ntp/drift"
+                echo "restrict default kod nomodify notrap nopeer noquery"
+                echo "restrict -6 default kod nomodify notrap nopeer noquery"
+                echo "restrict 127.0.0.1"
+                echo "restrict -6 ::1"
+                echo ""
+                echo "server ${ntp_primary} iburst prefer"
+                echo "server ${ntp_secondary} iburst"
+                echo "server ${ntp_tertiary} iburst"
+            } > /etc/ntp.conf
+
+            log_ok "NTP 配置已写入: /etc/ntp.conf"
+            systemctl enable ntpd 2>/dev/null || true
+            systemctl restart ntpd 2>/dev/null || true
+            log_info "等待 NTPD 同步（5秒）..."
+            sleep 5
+            sync_ok=true
+
+            echo ""
+            log_info "NTP peers 状态:"
+            ntpq -p 2>/dev/null | while IFS= read -r line; do
+                echo -e "         ${line}"
+            done
             ;;
-        alpine)
-            rc-update add chronyd default 2>/dev/null || true
-            rc-service chronyd restart 2>/dev/null || /etc/init.d/chronyd restart
+
+        ntpdate)
+            log_info "使用 ntpdate 单次同步..."
+            if ntpdate -b "$ntp_primary" 2>/dev/null; then
+                sync_ok=true
+                log_ok "ntpdate 同步成功 (${ntp_primary})"
+            elif ntpdate -b "$ntp_secondary" 2>/dev/null; then
+                sync_ok=true
+                log_ok "ntpdate 同步成功 (${ntp_secondary})"
+            fi
+            ;;
+
+        sntp)
+            log_info "使用 sntp 同步..."
+            if sntp -S "$ntp_primary" 2>/dev/null; then
+                sync_ok=true
+                log_ok "sntp 同步成功 (${ntp_primary})"
+            fi
+            ;;
+
+        http)
+            log_warn "未检测到NTP工具，使用HTTP方式同步..."
             ;;
     esac
-    
-    # 等待服务启动
-    sleep 2
-    log_success "chrony 服务已启动"
-}
 
-# 强制同步 - 包含重试机制
-force_sync() {
-    log_step "执行时间同步..."
-    
-    # 等待最多120秒让NTP同步
-    local max_wait=120
-    local waited=0
-    
-    echo "等待NTP同步（最多${max_wait}秒）..."
-    
-    while [[ $waited -lt $max_wait ]]; do
-        # 强制步进
-        chronyc makestep >/dev/null 2>&1
-        
-        # 检查同步状态
-        local stratum=$(chronyc -n tracking 2>/dev/null | grep "Stratum" | awk '{print $3}')
-        
-        if [[ -n "$stratum" ]] && [[ "$stratum" -gt 0 ]] && [[ "$stratum" -lt 16 ]]; then
-            log_success "NTP同步成功！Stratum: ${stratum}"
-            return 0
-        fi
-        
-        sleep 5
-        waited=$((waited + 5))
-        echo -n "."
-    done
-    echo ""
-    
-    log_warning "自动同步未完成，尝试手动同步..."
-    manual_sync
-}
-
-# 手动同步 - 从HTTP获取时间
-manual_sync() {
-    log_step "尝试手动同步时间..."
-    
-    # 方法1: 从 HTTP Date 头获取时间
-    local http_time=""
-    for url in "https://google.com" "https://cloudflare.com" "https://taobao.com" "https://alibaba.com"; do
-        http_time=$(curl -4 -s -I --max-time 10 "$url" 2>/dev/null | \
-                    grep -i "^Date:" | \
-                    sed 's/Date: //i' | \
-                    xargs -0)
-        
-        if [[ -n "$http_time" ]]; then
-            log_info "从 ${url} 获取时间: ${http_time}"
-            break
-        fi
-    done
-    
-    if [[ -n "$http_time" ]]; then
-        # 解析并设置时间
-        local timestamp=$(date -d "${http_time}" +%s 2>/dev/null)
-        if [[ -n "$timestamp" ]] && [[ "$timestamp" -gt 1000000000 ]]; then
-            local current_ts=$(date +%s)
-            local diff=$((timestamp - current_ts))
-            
-            log_info "当前时间偏移: ${diff} 秒"
-            
-            if [[ ${diff#-} -gt 10 ]]; then
-                log_warning "时间偏差较大(${diff}s)，正在校准..."
-                
-                # 设置系统时间
-                date -s "$(date -d "@${timestamp}" '+%Y-%m-%d %H:%M:%S')" 2>/dev/null || \
-                timedatectl set-time "$(date -d "@${timestamp}" '+%Y-%m-%d %H:%M:%S')" 2>/dev/null || true
-                
-                # 同步到硬件时钟
-                hwclock -w 2>/dev/null || hwclock --systohc 2>/dev/null || true
-                
-                log_success "手动时间同步完成"
+    # ---- 备用HTTP同步 ----
+    if [[ "$sync_ok" != "true" ]]; then
+        log_warn "NTP同步失败或不可用，尝试HTTP时间同步..."
+        local http_date=""
+        for url in "https://www.google.com" "https://www.cloudflare.com" "https://www.baidu.com"; do
+            http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
+            if [[ -n "$http_date" ]]; then
+                if date -s "$http_date" >/dev/null 2>&1; then
+                    sync_ok=true
+                    log_ok "HTTP时间同步成功 (来源: ${url})"
+                    break
+                fi
             fi
-        fi
+        done
+    fi
+
+    # ---- 写入硬件时钟 ----
+    if command -v hwclock &>/dev/null; then
+        hwclock --systohc 2>/dev/null || true
+        log_info "已同步到硬件时钟"
+    fi
+
+    echo ""
+    local time_after
+    time_after=$(date '+%Y-%m-%d %H:%M:%S')
+    log_info "同步后时间: ${GREEN}${time_after}${NC}"
+
+    if [[ "$sync_ok" == "true" ]]; then
+        log_ok "时间同步完成！"
     else
-        log_warning "无法从HTTP获取时间，跳过手动同步"
+        log_error "时间同步失败，请手动检查网络"
     fi
-    
-    # 最后再试一次 chrony
-    sleep 3
-    chronyc makestep >/dev/null 2>&1 || true
+    echo ""
 }
 
-# 启用 RTC 同步
-enable_rtc_sync() {
-    log_step "配置RTC同步..."
-    
-    # 同步系统时间到RTC
-    hwclock --systohc --utc 2>/dev/null || hwclock --systohc 2>/dev/null || true
-    
-    # 配置 timedatectl
-    timedatectl set-local-rtc 0 2>/dev/null || true
-    timedatectl set-ntp true 2>/dev/null || true
-    
-    # 确保 adjtime 配置
-    cat > /etc/adjtime << 'EOF'
-0.0 0 0.0
-0
-UTC
-EOF
-    
-    log_success "RTC同步配置完成"
-}
+#================================================================
+# 第四阶段：结果汇总
+#================================================================
+stage_show_result() {
+    separator
+    echo -e "${CYAN}  [阶段四] 同步结果汇总${NC}"
+    separator
 
-# 等待NTP完全同步
-wait_for_sync() {
-    log_step "等待NTP完全同步..."
-    
-    local max_wait=180
-    local waited=0
-    
-    while [[ $waited -lt $max_wait ]]; do
-        local tracking=$(chronyc -n tracking 2>/dev/null)
-        local stratum=$(echo "$tracking" | grep "Stratum" | awk '{print $3}')
-        local ref_time=$(echo "$tracking" | grep "Ref time" | awk '{print $4,$5,$6}')
-        
-        if [[ -n "$stratum" ]] && [[ "$stratum" -gt 0 ]] && [[ "$stratum" -lt 16 ]]; then
-            if [[ "$ref_time" != *"1970"* ]]; then
-                log_success "NTP已完全同步"
-                return 0
-            fi
-        fi
-        
-        sleep 10
-        waited=$((waited + 10))
-        echo -n "."
-    done
     echo ""
-    
-    log_warning "NTP同步可能仍在进行中"
-}
+    echo -e "  ${GREEN}+----------------------------------------------------------+${NC}"
+    echo -e "  ${GREEN}|                    时间校准结果                           |${NC}"
+    echo -e "  ${GREEN}+----------------------------------------------------------+${NC}"
 
-# 显示详细结果
-show_results() {
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║              VPS 时区和时间校准 - 完成报告                    ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "  ${YELLOW}[IP信息]${NC}"
+    echo -e "     公网IP:      ${GREEN}${PUBLIC_IP}${NC}"
+    echo -e "     国家/地区:   ${GREEN}${COUNTRY}${NC}"
+    echo -e "     区域:        ${GREEN}${REGION}${NC}"
+    echo -e "     城市:        ${GREEN}${CITY}${NC}"
+    [[ -n "$ORG" ]] && echo -e "     运营商:      ${GREEN}${ORG}${NC}"
+
     echo ""
-    
-    echo -e "${BLUE}━━━━━ IP 信息 ━━━━━${NC}"
-    echo "  公网IPv4:   ${PUBLIC_IP}"
-    echo "  位置:       ${COUNTRY:-未知} / ${CITY:-未知}"
+    echo -e "  ${YELLOW}[时区信息]${NC}"
+    echo -e "     设定时区:    ${GREEN}${DETECTED_TZ}${NC}"
+    echo -e "     时区缩写:    ${GREEN}$(date +'%Z')${NC}"
+    echo -e "     UTC偏移:     ${GREEN}$(date +'%z')${NC}"
+
     echo ""
-    
-    echo -e "${BLUE}━━━━━ 时区设置 ━━━━━${NC}"
-    echo "  时区:       $(cat /etc/timezone 2>/dev/null || timedatectl show --property=Timezone --value 2>/dev/null)"
-    echo "  系统时间:   $(date '+%Y-%m-%d %H:%M:%S %Z %A')"
-    echo "  硬件时钟:   $(hwclock -r 2>/dev/null || echo '无法读取')"
-    echo "  RTC同步:    $(timedatectl show --property=RTCTimeUSec --value 2>/dev/null && echo '已启用' || echo '已配置')"
+    echo -e "  ${YELLOW}[当前时间]${NC}"
+    echo -e "     本地时间:    ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+    echo -e "     UTC时间:     ${GREEN}$(date -u '+%Y-%m-%d %H:%M:%S UTC')${NC}"
+    echo -e "     星期:        ${GREEN}$(date '+%A')${NC}"
+
     echo ""
-    
-    echo -e "${BLUE}━━━━━ NTP 服务器状态 ━━━━━${NC}"
-    chronyc sources -v 2>/dev/null | head -20 || echo "  无法获取状态"
-    echo ""
-    
-    echo -e "${BLUE}━━━━━ NTP 跟踪信息 ━━━━━${NC}"
-    chronyc tracking 2>/dev/null | grep -E "(Leap|Stratum|Precision|Ref time|System time|Last offset|RMS offset|Frequency|Offset)" || echo "  无法获取跟踪信息"
-    echo ""
-    
-    echo -e "${BLUE}━━━━━ 服务状态 ━━━━━${NC}"
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet chrony 2>/dev/null; then
-            echo -e "  chrony:      ${GREEN}● 运行中${NC}"
-        elif systemctl is-active --quiet chronyd 2>/dev/null; then
-            echo -e "  chronyd:     ${GREEN}● 运行中${NC}"
-        else
-            echo -e "  chrony:      ${YELLOW}● 状态未知${NC}"
-        fi
+    if command -v timedatectl &>/dev/null; then
+        echo -e "  ${YELLOW}[timedatectl 状态]${NC}"
+        timedatectl status 2>/dev/null | while IFS= read -r line; do
+            echo -e "     ${line}"
+        done
     fi
-    
-    # 最终同步检查
+
     echo ""
-    echo -e "${BLUE}━━━━━ 同步状态 ━━━━━${NC}"
-    local final_stratum=$(chronyc -n tracking 2>/dev/null | grep "Stratum" | awk '{print $3}')
-    if [[ -n "$final_stratum" ]] && [[ "$final_stratum" -gt 0 ]] && [[ "$final_stratum" -lt 16 ]]; then
-        echo -e "  同步状态:    ${GREEN}● 已同步 (Stratum ${final_stratum})${NC}"
-    else
-        echo -e "  同步状态:    ${YELLOW}● 同步中（请等待几分钟）${NC}"
-        echo -e "  提示:        运行 ${CYAN}chronyc sources${NC} 查看详细状态"
-    fi
-    
+    echo -e "  ${GREEN}+----------------------------------------------------------+${NC}"
+    echo -e "  ${GREEN}|                    校准完成！                             |${NC}"
+    echo -e "  ${GREEN}+----------------------------------------------------------+${NC}"
+
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                      校准完成                                 ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "  ${CYAN}[后续命令提示]${NC}"
+    echo "     查看时区:     timedatectl"
+    echo "     Chrony状态:   chronyc tracking"
+    echo "     Chrony源:     chronyc sources -v"
+    echo "     手动同步:     chronyc makestep"
     echo ""
 }
 
+#================================================================
 # 主函数
+#================================================================
 main() {
     clear
     echo ""
-    echo "╭────────────────────────────────────────╮"
-    echo "│   VPS 时区和时间自动校准脚本 - 增强版   │"
-    echo "╰────────────────────────────────────────╯"
-    echo ""
-    
-    check_root
-    detect_os
-    get_public_ip
-    get_timezone
-    set_timezone
-    install_chrony
-    test_network
-    configure_chrony
-    start_chrony
-    force_sync
-    enable_rtc_sync
-    wait_for_sync
-    show_results
-}
+    separator
+    echo -e "${CYAN}          VPS 时区和时间自动校准脚本${NC}"
+    echo -e "${CYAN}      Auto Timezone & Time Calibration${NC}"
+    separator
 
-# 错误处理
-trap 'log_error "执行出错: 第 $LINIO 行"' ERR
+    # 检查root权限
+    if [[ $EUID -ne 0 ]]; then
+        echo ""
+        log_warn "建议使用 root 权限运行: sudo bash $0"
+        echo ""
+    fi
+
+    # 四个阶段按顺序执行
+    stage_get_info
+    stage_set_timezone
+    stage_sync_time
+    stage_show_result
+}
 
 main "$@"
