@@ -32,7 +32,7 @@
 ## 🚀 一键运行
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-calibrate/main/tz-chronyd.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-chronyd/main/tz-chronyd.sh)
 ```
 
 ## 🛠️ 后续常用命令
