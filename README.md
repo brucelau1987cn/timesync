@@ -2,7 +2,7 @@
 
 自动根据 VPS 公网IP地址识别所属时区，配置系统时区并通过NTP同步时间，全程无需手动操作。
 
-## 工作流程
+## 🔄 工作流程
 ### 阶段一：获取公网IP和时区
   curl -4 ip.sb → 获取公网IPv4
   curl ipinfo.io/{IP} → 获取时区/地区/运营商
@@ -16,7 +16,7 @@
 ### 阶段四：输出结果汇总
   IP信息 / 时区信息 / 同步前后时间对比
 
-## NTP工具处理逻辑
+## 🔧 NTP工具处理逻辑
 ```
 检测系统已安装的NTP工具
 ├── 有 chronyd   → 直接使用
@@ -35,7 +35,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-calibrate/main/tz-chronyd.sh)
 ```
 
-## 后续常用命令
+## 🛠️ 后续常用命令
 
 ```bash
 # 查看当前时间和时区状态
