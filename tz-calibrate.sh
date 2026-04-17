@@ -1,827 +1,548 @@
-#!/usr/bin/env bash
-# =============================================================================
-# VPS 时区自动校准脚本 v2.7
-# 根据公网 IP 归属地自动识别所在时区并完成校准
-# 支持：Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等主流发行版
-# 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE] [--ntp chrony|ntpdate|timesyncd]
-# =============================================================================
+#!/bin/bash
+
+# ============================================================
+# VPS 时区与时间自动校准脚本
+# 功能：自动识别时区 → 选择校时工具 → 从网络大站获取时间并校准
+# 支持：Debian/Ubuntu、CentOS/RHEL/Fedora、Alpine
+# ============================================================
 
 set -euo pipefail
 
-trap 'echo -e "\033[0;31m[FATAL]\033[0m 脚本在第 $LINENO 行意外退出（退出码: $?）" >&2' EXIT
+# ==================== 颜色定义 ====================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# ---------- 颜色输出 ----------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-info()    { echo -e "${CYAN}[INFO]${RESET}  $*" >&2; }
-success() { echo -e "${GREEN}[OK]${RESET}    $*" >&2; }
-warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*" >&2; }
-error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
-die()     { error "$*"; exit 1; }
+# ==================== 工具函数 ====================
+info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+header()  { echo -e "\n${BLUE}========================================${NC}"; echo -e "${BOLD}  $*${NC}"; echo -e "${BLUE}========================================${NC}"; }
+divider() { echo -e "${CYAN}────────────────────────────────────────${NC}"; }
 
-# ---------- 参数解析 ----------
-DRY_RUN=false
-FORCE_TZ=""
-NTP_TOOL=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dry-run) DRY_RUN=true; shift ;;
-    --force)   FORCE_TZ="${2:-}"; shift 2 ;;
-    --ntp)
-      case "${2:-}" in
-        chrony|ntpdate|timesyncd) NTP_TOOL="$2"; shift 2 ;;
-        *) die "--ntp 参数只接受 chrony、ntpdate 或 timesyncd" ;;
-      esac ;;
-    -h|--help)
-      cat <<'EOF'
-用法: bash tz-calibrate.sh [选项]
-
-选项:
-  --dry-run                       仅检测，不修改系统
-  --force TIMEZONE                强制使用指定时区，例如 Asia/Tokyo
-  --ntp chrony|ntpdate|timesyncd  指定 NTP 同步工具（跳过交互选择）
-  -h, --help                      显示帮助
-
-示例:
-  bash tz-calibrate.sh                        # 自动检测，交互选择 NTP 工具
-  bash tz-calibrate.sh --ntp chrony           # 自动检测，强制使用 chrony
-  bash tz-calibrate.sh --ntp timesyncd        # 自动检测，使用 systemd-timesyncd
-  bash tz-calibrate.sh --ntp ntpdate          # 自动检测，使用 ntpdate
-  bash tz-calibrate.sh --force Asia/Tokyo     # 强制东京时区
-  bash tz-calibrate.sh --dry-run              # 仅检测不修改
-EOF
-      trap - EXIT; exit 0 ;;
-    *) die "未知参数: $1，使用 --help 查看帮助" ;;
-  esac
-done
-
-# ---------- 权限检查 ----------
-if [[ $EUID -ne 0 ]] && ! $DRY_RUN; then
-  die "请以 root 权限运行，或使用 --dry-run 进行检测"
-fi
-
-# ---------- 依赖检查 ----------
-FETCH_CMD=""
-for cmd in curl wget; do
-  if command -v "$cmd" &>/dev/null; then
-    FETCH_CMD="$cmd"; break
-  fi
-done
-[[ -z "$FETCH_CMD" ]] && die "需要 curl 或 wget，请先安装后重试"
-
-http_get() {
-  local url="$1"
-  if [[ "$FETCH_CMD" == "curl" ]]; then
-    curl -fsSL --max-time 8 "$url" 2>/dev/null
-  else
-    wget -qO- --timeout=8 "$url" 2>/dev/null
-  fi
-}
-
-# ---------- 平台检测 ----------
-detect_platform() {
-  local os_name="" os_ver="" pkg_mgr="" arch="" init_sys=""
-  arch=$(uname -m 2>/dev/null || echo "unknown")
-
-  if [ -f /etc/os-release ]; then
-    os_name=$(. /etc/os-release && echo "${NAME:-unknown}")
-    os_ver=$(. /etc/os-release && echo "${VERSION_ID:-}")
-  elif [ -f /etc/redhat-release ]; then
-    os_name=$(cat /etc/redhat-release)
-  elif [ -f /etc/alpine-release ]; then
-    os_name="Alpine"
-    os_ver=$(cat /etc/alpine-release)
-  else
-    os_name=$(uname -s)
-  fi
-
-  if command -v apt-get &>/dev/null; then
-    pkg_mgr="apt"
-  elif command -v dnf &>/dev/null; then
-    pkg_mgr="dnf"
-  elif command -v yum &>/dev/null; then
-    pkg_mgr="yum"
-  elif command -v apk &>/dev/null; then
-    pkg_mgr="apk"
-  elif command -v pacman &>/dev/null; then
-    pkg_mgr="pacman"
-  elif command -v zypper &>/dev/null; then
-    pkg_mgr="zypper"
-  else
-    pkg_mgr="unknown"
-  fi
-
-  if command -v systemctl &>/dev/null && systemctl --version &>/dev/null; then
-    init_sys="systemd"
-  elif command -v rc-service &>/dev/null; then
-    init_sys="openrc"
-  elif [ -f /etc/init.d/cron ]; then
-    init_sys="sysvinit"
-  else
-    init_sys="unknown"
-  fi
-
-  echo "${os_name}|${os_ver}|${pkg_mgr}|${arch}|${init_sys}"
-}
-
-# ---------- NTP 工具交互选择 ----------
-select_ntp_tool() {
-  local init_sys="$1"
-
-  if [ -n "$NTP_TOOL" ]; then
-    echo "$NTP_TOOL"
-    return
-  fi
-
-  local timesyncd_available=true
-  if [ "$init_sys" != "systemd" ]; then
-    timesyncd_available=false
-  fi
-
-  echo "" >&2
-  echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}" >&2
-  echo -e "${BOLD}║              选择 NTP 时间同步工具                          ║${RESET}" >&2
-  echo -e "${BOLD}╠══════════════════════════════════════════════════════════════╣${RESET}" >&2
-  echo -e "${BOLD}║${RESET}                                                            ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  ${GREEN}[1] chrony${RESET}  ${BOLD}⭐ 推荐${RESET}                                        ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      类型 : 后台常驻服务（守护进程）                        ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      同步 : 安装后 24/7 自动持续同步，开机自启              ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      精度 : ${GREEN}亚毫秒级${RESET}，渐进式平滑调整                       ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      优势 : 专门优化 VPS/VM 时钟漂移，断网自动恢复          ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      资源 : 约 2-3MB 内存常驻                               ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      兼容 : ${GREEN}所有 Linux 发行版${RESET}                              ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      维护 : ${GREEN}活跃开发中${RESET}                                     ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}                                                            ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  ${CYAN}[2] systemd-timesyncd${RESET}                                       ${BOLD}║${RESET}" >&2
-  if $timesyncd_available; then
-    echo -e "${BOLD}║${RESET}      类型 : 轻量后台服务（systemd 内置组件）                ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      同步 : 自动持续同步，开机自启                          ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      精度 : ${YELLOW}毫秒级${RESET}，基础 SNTP 协议                        ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      优势 : 最轻量，无额外依赖，Debian/Ubuntu 常预装        ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      资源 : 约 1MB 内存                                     ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      兼容 : ${YELLOW}仅 systemd 系统${RESET}（不支持 Alpine 等）           ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      局限 : 不支持作为 NTP 服务器，无法精细调参              ${BOLD}║${RESET}" >&2
-    echo -e "${BOLD}║${RESET}      维护 : ${GREEN}随 systemd 更新${RESET}                                ${BOLD}║${RESET}" >&2
-  else
-    echo -e "${BOLD}║${RESET}      ${RED}⚠ 当前系统不是 systemd，此选项不可用${RESET}                  ${BOLD}║${RESET}" >&2
-  fi
-  echo -e "${BOLD}║${RESET}                                                            ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  ${YELLOW}[3] ntpdate${RESET}                                                 ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      类型 : 一次性命令行工具（非守护进程）                   ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      同步 : 手动执行一次校准一次，需配合 crontab             ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      精度 : ${YELLOW}毫秒级${RESET}，直接跳变系统时间                       ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      劣势 : 断网后需手动再跑，大跳变可能影响日志             ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      资源 : 仅运行时占资源                                   ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      兼容 : ${GREEN}所有 Linux 发行版${RESET}                              ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}      维护 : ${RED}已废弃，Debian/Ubuntu 逐步移除${RESET}                   ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}                                                            ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}╠══════════════════════════════════════════════════════════════╣${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  ${BOLD}对比总结:${RESET}                                                   ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  ┌──────────────┬──────────┬───────────┬──────────┐      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │     特性     │ ${GREEN}chrony${RESET}   │ ${CYAN}timesyncd${RESET} │ ${YELLOW}ntpdate${RESET}  │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  ├──────────────┼──────────┼───────────┼──────────┤      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 持续同步     │  ${GREEN}✔ 是${RESET}   │  ${GREEN}✔ 是${RESET}    │  ${RED}✘ 否${RESET}   │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 开机自启     │  ${GREEN}✔ 是${RESET}   │  ${GREEN}✔ 是${RESET}    │  ${RED}✘ 否${RESET}   │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 精度         │ ${GREEN}亚毫秒${RESET}  │  ${YELLOW}毫秒${RESET}    │  ${YELLOW}毫秒${RESET}   │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ VPS优化      │  ${GREEN}✔ 有${RESET}   │  ${RED}✘ 无${RESET}    │  ${RED}✘ 无${RESET}   │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 断网恢复     │  ${GREEN}自动${RESET}   │  ${GREEN}自动${RESET}    │  ${YELLOW}手动${RESET}   │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 内存占用     │ ${YELLOW}2-3MB${RESET}   │  ${GREEN}~1MB${RESET}    │  ${GREEN}0${RESET}      │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 兼容性       │ ${GREEN}全平台${RESET}  │ ${YELLOW}systemd${RESET}  │ ${GREEN}全平台${RESET}  │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  │ 维护状态     │  ${GREEN}活跃${RESET}   │  ${GREEN}活跃${RESET}    │  ${RED}废弃${RESET}   │      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  └──────────────┴──────────┴───────────┴──────────┘      ${BOLD}║${RESET}" >&2
-  echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}" >&2
-  echo "" >&2
-
-  local choice=""
-  local timeout_sec=15
-  local valid_options="1/2/3"
-  if ! $timesyncd_available; then
-    valid_options="1/3（选项 2 不可用）"
-  fi
-
-  if [ -t 0 ]; then
-    echo -e "请选择 [${valid_options}]（${timeout_sec} 秒无输入默认选 1-chrony）: \c" >&2
-    if read -t "$timeout_sec" -r choice 2>/dev/null; then
-      true
-    else
-      echo "" >&2
-      info "超时未输入，使用默认选择"
-      choice="1"
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "请以 root 权限运行此脚本：sudo bash $0"
+        exit 1
     fi
-  else
-    info "非交互模式，自动选择默认: chrony"
-    choice="1"
-  fi
-
-  case "$choice" in
-    2)
-      if $timesyncd_available; then
-        info "已选择: systemd-timesyncd"
-        echo "timesyncd"
-      else
-        warn "当前系统不支持 timesyncd，自动切换为 chrony"
-        echo "chrony"
-      fi
-      ;;
-    3)
-      info "已选择: ntpdate"
-      echo "ntpdate"
-      ;;
-    *)
-      info "已选择: chrony（推荐）"
-      echo "chrony"
-      ;;
-  esac
 }
 
-# ---------- 国家 → 时区回退表 ----------
-declare -A COUNTRY_TZ=(
-  [CN]="Asia/Shanghai"     [JP]="Asia/Tokyo"        [KR]="Asia/Seoul"
-  [SG]="Asia/Singapore"    [HK]="Asia/Hong_Kong"    [TW]="Asia/Taipei"
-  [TH]="Asia/Bangkok"      [VN]="Asia/Ho_Chi_Minh"  [MY]="Asia/Kuala_Lumpur"
-  [ID]="Asia/Jakarta"      [PH]="Asia/Manila"       [IN]="Asia/Kolkata"
-  [PK]="Asia/Karachi"      [BD]="Asia/Dhaka"        [LK]="Asia/Colombo"
-  [NP]="Asia/Kathmandu"    [AE]="Asia/Dubai"        [SA]="Asia/Riyadh"
-  [QA]="Asia/Qatar"        [KW]="Asia/Kuwait"       [IL]="Asia/Jerusalem"
-  [TR]="Europe/Istanbul"   [RU]="Europe/Moscow"     [DE]="Europe/Berlin"
-  [FR]="Europe/Paris"      [GB]="Europe/London"     [NL]="Europe/Amsterdam"
-  [IT]="Europe/Rome"       [ES]="Europe/Madrid"     [PL]="Europe/Warsaw"
-  [SE]="Europe/Stockholm"  [NO]="Europe/Oslo"       [FI]="Europe/Helsinki"
-  [CH]="Europe/Zurich"     [AT]="Europe/Vienna"     [PT]="Europe/Lisbon"
-  [US]="America/New_York"  [CA]="America/Toronto"   [MX]="America/Mexico_City"
-  [BR]="America/Sao_Paulo" [AR]="America/Argentina/Buenos_Aires"
-  [CL]="America/Santiago"  [CO]="America/Bogota"    [PE]="America/Lima"
-  [AU]="Australia/Sydney"  [NZ]="Pacific/Auckland"  [ZA]="Africa/Johannesburg"
-  [NG]="Africa/Lagos"      [EG]="Africa/Cairo"      [KE]="Africa/Nairobi"
+# 检测包管理器
+detect_pkg_manager() {
+    if command -v apt-get &>/dev/null; then
+        PKG_MGR="apt"
+        PKG_INSTALL="apt-get install -y"
+        PKG_UPDATE="apt-get update -y"
+    elif command -v yum &>/dev/null; then
+        PKG_MGR="yum"
+        PKG_INSTALL="yum install -y"
+        PKG_UPDATE="yum makecache -y"
+    elif command -v dnf &>/dev/null; then
+        PKG_MGR="dnf"
+        PKG_INSTALL="dnf install -y"
+        PKG_UPDATE="dnf makecache -y"
+    elif command -v apk &>/dev/null; then
+        PKG_MGR="apk"
+        PKG_INSTALL="apk add"
+        PKG_UPDATE="apk update"
+    elif command -v pacman &>/dev/null; then
+        PKG_MGR="pacman"
+        PKG_INSTALL="pacman -S --noconfirm"
+        PKG_UPDATE="pacman -Sy"
+    else
+        error "未检测到支持的包管理器"
+        exit 1
+    fi
+    info "检测到包管理器: ${BOLD}${PKG_MGR}${NC}"
+}
+
+# ==================== 第一步：根据公网IP确定时区 ====================
+detect_timezone_by_ip() {
+    header "第一步：根据公网 IP 自动检测时区"
+
+    local public_ip=""
+    local timezone=""
+
+    # 获取公网 IP
+    info "正在获取公网 IP 地址..."
+    local ip_services=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://icanhazip.com"
+        "https://ipinfo.io/ip"
+    )
+
+    for svc in "${ip_services[@]}"; do
+        public_ip=$(curl -s --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$public_ip" && "$public_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            info "公网 IP: ${BOLD}${public_ip}${NC}  (来源: $svc)"
+            break
+        fi
+        public_ip=""
+    done
+
+    if [[ -z "$public_ip" ]]; then
+        warn "无法获取公网 IP，将使用 UTC 作为默认时区"
+        DETECTED_TZ="UTC"
+        return
+    fi
+
+    # 通过 IP 查询时区
+    info "正在通过 IP 查询所属时区..."
+    local tz_services=(
+        "http://ip-api.com/json/${public_ip}?fields=timezone,country,city,query"
+        "https://ipapi.co/${public_ip}/json/"
+        "https://ipwho.is/${public_ip}"
+    )
+
+    for svc in "${tz_services[@]}"; do
+        local resp
+        resp=$(curl -s --max-time 5 "$svc" 2>/dev/null)
+        if [[ -n "$resp" ]]; then
+            # 尝试提取 timezone 字段
+            timezone=$(echo "$resp" | grep -oP '"timezone"\s*:\s*"\K[^"]+' 2>/dev/null | head -1)
+            if [[ -n "$timezone" && "$timezone" == *"/"* ]]; then
+                local country city
+                country=$(echo "$resp" | grep -oP '"country"\s*:\s*"\K[^"]+' 2>/dev/null | head -1)
+                city=$(echo "$resp" | grep -oP '"city"\s*:\s*"\K[^"]+' 2>/dev/null | head -1)
+                info "查询结果:  国家=${BOLD}${country:-未知}${NC}  城市=${BOLD}${city:-未知}${NC}"
+                info "检测时区:  ${BOLD}${timezone}${NC}"
+                break
+            fi
+            timezone=""
+        fi
+    done
+
+    if [[ -z "$timezone" ]]; then
+        warn "无法通过 IP 确定时区，使用 UTC"
+        timezone="UTC"
+    fi
+
+    DETECTED_TZ="$timezone"
+
+    divider
+    echo -e "  检测到的时区: ${GREEN}${BOLD}${DETECTED_TZ}${NC}"
+    echo -e "  当前系统时区: ${YELLOW}$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo '未知')${NC}"
+    divider
+
+    echo ""
+    read -rp "$(echo -e "${CYAN}是否将系统时区设置为 ${BOLD}${DETECTED_TZ}${NC}${CYAN} ? [Y/n]: ${NC}")" confirm
+    confirm="${confirm:-Y}"
+
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # 设置时区
+        if command -v timedatectl &>/dev/null; then
+            timedatectl set-timezone "$DETECTED_TZ"
+        else
+            ln -sf "/usr/share/zoneinfo/${DETECTED_TZ}" /etc/localtime
+            echo "$DETECTED_TZ" > /etc/timezone
+        fi
+        info "时区已设置为: ${BOLD}${DETECTED_TZ}${NC}"
+    else
+        read -rp "$(echo -e "${CYAN}请手动输入时区 (如 Asia/Shanghai): ${NC}")" manual_tz
+        if [[ -f "/usr/share/zoneinfo/${manual_tz}" ]]; then
+            if command -v timedatectl &>/dev/null; then
+                timedatectl set-timezone "$manual_tz"
+            else
+                ln -sf "/usr/share/zoneinfo/${manual_tz}" /etc/localtime
+                echo "$manual_tz" > /etc/timezone
+            fi
+            DETECTED_TZ="$manual_tz"
+            info "时区已设置为: ${BOLD}${manual_tz}${NC}"
+        else
+            error "无效时区: $manual_tz，保持当前时区不变"
+        fi
+    fi
+}
+
+# ==================== 第二步：选择校时工具 ====================
+select_sync_tool() {
+    header "第二步：选择时间同步工具"
+
+    # 检测已安装状态
+    local chrony_installed=false
+    local ntpdate_installed=false
+    local timesyncd_installed=false
+
+    command -v chronyd &>/dev/null && chrony_installed=true
+    command -v chronyc &>/dev/null && chrony_installed=true
+    command -v ntpdate &>/dev/null && ntpdate_installed=true
+    [[ -f /lib/systemd/system/systemd-timesyncd.service ]] && timesyncd_installed=true
+    systemctl list-unit-files systemd-timesyncd.service &>/dev/null 2>&1 && timesyncd_installed=true
+
+    local c_status y_status t_status
+    $chrony_installed   && c_status="${GREEN}[已安装]${NC}" || c_status="${RED}[未安装]${NC}"
+    $ntpdate_installed  && y_status="${GREEN}[已安装]${NC}" || y_status="${RED}[未安装]${NC}"
+    $timesyncd_installed && t_status="${GREEN}[已安装]${NC}" || t_status="${RED}[未安装]${NC}"
+
+    echo ""
+    echo -e "${BOLD}┌─────┬────────────────────┬──────────┬───────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}│ 编号│ 工具名称           │ 安装状态 │ 说明                                              │${NC}"
+    echo -e "${BOLD}├─────┼────────────────────┼──────────┼───────────────────────────────────────────────────┤${NC}"
+    echo -e "│  1  │ ${CYAN}chrony (chronyc)${NC}  │ $c_status  │ 现代 NTP 客户端/服务端，精度高，适合虚拟机与     │"
+    echo -e "│     │                    │          │ 容器环境。支持突发校时+渐进调整，启动快、内存少。 │"
+    echo -e "│     │                    │          │ ${GREEN}★ 推荐用于生产服务器${NC}                              │"
+    echo -e "├─────┼────────────────────┼──────────┼───────────────────────────────────────────────────┤${NC}"
+    echo -e "│  2  │ ${CYAN}ntpdate${NC}            │ $y_status  │ 传统一次性时间同步工具，立即将系统时间跳变到     │"
+    echo -e "│     │                    │          │ NTP 服务器时间。不作为守护进程运行，仅单次校时。   │"
+    echo -e "│     │                    │          │ ${YELLOW}⚠ 已被弃用，适合临时手动校时${NC}                      │"
+    echo -e "├─────┼────────────────────┼──────────┼───────────────────────────────────────────────────┤${NC}"
+    echo -e "│  3  │ ${CYAN}systemd-timesyncd${NC}  │ $t_status  │ systemd 内置轻量级 SNTP 客户端，仅做客户端同步。 │"
+    echo -e "│     │                    │          │ 配置简单、资源占用最小，适合桌面/轻量VPS。         │"
+    echo -e "│     │                    │          │ ${BLUE}◆ 适合不需要高精度的场景${NC}                          │"
+    echo -e "${BOLD}└─────┴────────────────────┴──────────┴───────────────────────────────────────────────────┘${NC}"
+
+    echo ""
+    echo -e "${BOLD}三者核心区别：${NC}"
+    divider
+    echo -e "  ${CYAN}chrony${NC}     ─ 精度最高(微秒级)，支持间歇性网络，既是客户端也可当服务端"
+    echo -e "  ${CYAN}ntpdate${NC}    ─ 一次性跳变校时，无守护进程，校完即退出，不持续同步"
+    echo -e "  ${CYAN}timesyncd${NC}  ─ 最轻量(systemd自带)，仅SNTP客户端，精度毫秒级，功能最少"
+    divider
+    echo ""
+
+    read -rp "$(echo -e "${CYAN}请选择校时工具 [1/2/3] (默认1): ${NC}")" tool_choice
+    tool_choice="${tool_choice:-1}"
+
+    case "$tool_choice" in
+        1) setup_chrony "$chrony_installed" ;;
+        2) setup_ntpdate "$ntpdate_installed" ;;
+        3) setup_timesyncd "$timesyncd_installed" ;;
+        *) error "无效选择"; exit 1 ;;
+    esac
+}
+
+# NTP 服务器池
+NTP_SERVERS=(
+    "pool.ntp.org"
+    "time.cloudflare.com"
+    "time.google.com"
+    "time.apple.com"
+    "ntp.aliyun.com"
 )
 
-# ---------- 验证时区合法性 ----------
-validate_timezone() {
-  local tz="$1"
-  for base in /usr/share/zoneinfo /usr/lib/zoneinfo /usr/share/lib/zoneinfo; do
-    [[ -f "${base}/${tz}" ]] && return 0
-  done
-  return 1
-}
+# ---------- chrony ----------
+setup_chrony() {
+    local installed=$1
+    info "选择了 chrony"
 
-# ---------- 查找 zoneinfo 基础路径 ----------
-find_zoneinfo_base() {
-  for base in /usr/share/zoneinfo /usr/lib/zoneinfo /usr/share/lib/zoneinfo; do
-    [[ -d "$base" ]] && echo "$base" && return 0
-  done
-  die "找不到 zoneinfo 数据库，请安装 tzdata 包"
-}
-
-# ---------- 获取 IP 和时区信息 ----------
-detect_timezone() {
-  info "正在检测公网 IP 归属地..."
-  local tz="" country="" ip="" city="" resp=""
-
-  resp=$(http_get "https://ipinfo.io/json") || resp=""
-  if [[ -n "$resp" ]]; then
-    ip=$(echo "$resp"      | grep -oP '"ip"\s*:\s*"\K[^"]+' || true)
-    country=$(echo "$resp" | grep -oP '"country"\s*:\s*"\K[^"]+' || true)
-    city=$(echo "$resp"    | grep -oP '"city"\s*:\s*"\K[^"]+' || true)
-    tz=$(echo "$resp"      | grep -oP '"timezone"\s*:\s*"\K[^"]+' || true)
-    info "公网 IP: ${ip:-未知}  位置: ${city:-?}, ${country:-?}"
-  fi
-
-  if [[ -z "$tz" ]]; then
-    warn "ipinfo.io 未返回时区，尝试 ip-api.com..."
-    resp=$(http_get "http://ip-api.com/json?fields=status,countryCode,timezone,city,query") || resp=""
-    if [[ -n "$resp" ]]; then
-      local status
-      status=$(echo "$resp" | grep -oP '"status"\s*:\s*"\K[^"]+' || true)
-      if [[ "$status" == "success" ]]; then
-        [[ -z "$ip" ]]      && ip=$(echo "$resp"      | grep -oP '"query"\s*:\s*"\K[^"]+' || true)
-        [[ -z "$country" ]] && country=$(echo "$resp" | grep -oP '"countryCode"\s*:\s*"\K[^"]+' || true)
-        [[ -z "$city" ]]    && city=$(echo "$resp"    | grep -oP '"city"\s*:\s*"\K[^"]+' || true)
-        tz=$(echo "$resp"   | grep -oP '"timezone"\s*:\s*"\K[^"]+' || true)
-      fi
-    fi
-  fi
-
-  if [[ -z "$tz" && -n "$country" ]]; then
-    warn "API 未返回时区字段，使用国家代码 [${country}] 查询回退表"
-    tz="${COUNTRY_TZ[$country]:-}"
-    [[ -z "$tz" ]] && die "国家 [${country}] 不在回退表中，请使用 --force 手动指定时区"
-  fi
-
-  [[ -z "$tz" ]] && die "无法获取时区信息。请检查网络，或使用 --force TIMEZONE 手动指定"
-  echo "$tz"
-}
-
-# ---------- 设置系统时区 ----------
-apply_timezone() {
-  local tz="$1"
-  if ! validate_timezone "$tz"; then
-    die "时区 [${tz}] 无效或 zoneinfo 文件不存在，请确认系统已安装 tzdata"
-  fi
-  if $DRY_RUN; then
-    info "[dry-run] 将设置时区为: ${tz}"
-    return
-  fi
-  if command -v timedatectl &>/dev/null; then
-    timedatectl set-timezone "$tz"
-    success "已通过 timedatectl 设置时区: ${tz}"
-  else
-    local zoneinfo_base
-    zoneinfo_base=$(find_zoneinfo_base)
-    ln -sf "${zoneinfo_base}/${tz}" /etc/localtime
-    echo "$tz" > /etc/timezone
-    success "已通过软链接设置时区: ${tz}"
-  fi
-}
-
-# ---------- 安装指定 NTP 工具 ----------
-install_ntp_tool() {
-  local tool="$1" pkg_mgr="$2"
-  local pkg_name="$tool"
-  local install_ok=false
-
-  case "$tool" in
-    timesyncd)
-      case "$pkg_mgr" in
-        apt) pkg_name="systemd-timesyncd" ;;
-        *)   pkg_name="systemd" ;;
-      esac
-      ;;
-  esac
-
-  info "正在安装 ${pkg_name}..."
-
-  case "$pkg_mgr" in
-    apt)
-      info "[apt] 更新索引..."
-      apt-get update -qq 2>/dev/null
-      info "[apt] 安装 ${pkg_name}..."
-      if apt-get install -y -qq "$pkg_name" 2>/dev/null; then install_ok=true; fi
-      ;;
-    dnf)
-      info "[dnf] 安装 ${pkg_name}..."
-      if dnf install -y -q "$pkg_name" 2>/dev/null; then install_ok=true; fi
-      ;;
-    yum)
-      info "[yum] 安装 ${pkg_name}..."
-      if yum install -y -q "$pkg_name" 2>/dev/null; then install_ok=true; fi
-      ;;
-    apk)
-      info "[apk] 安装 ${pkg_name}..."
-      if apk add --quiet "$pkg_name" 2>/dev/null; then install_ok=true; fi
-      ;;
-    pacman)
-      info "[pacman] 安装 ${pkg_name}..."
-      if pacman -Sy --noconfirm "$pkg_name" 2>/dev/null; then install_ok=true; fi
-      ;;
-    zypper)
-      info "[zypper] 安装 ${pkg_name}..."
-      if zypper install -y "$pkg_name" 2>/dev/null; then install_ok=true; fi
-      ;;
-    *)
-      warn "未识别的包管理器 [${pkg_mgr}]，无法自动安装"
-      return 1
-      ;;
-  esac
-
-  if $install_ok; then
-    success "${pkg_name} 安装成功"
-    return 0
-  else
-    warn "${pkg_name} 安装失败"
-    return 1
-  fi
-}
-
-# ---------- chrony 同步 ----------
-sync_with_chrony() {
-  info "启动 chronyd 服务..."
-  if command -v systemctl &>/dev/null; then
-    systemctl enable --now chronyd 2>/dev/null || true
-  elif command -v rc-service &>/dev/null; then
-    rc-service chronyd start 2>/dev/null || true
-    rc-update add chronyd default 2>/dev/null || true
-  else
-    chronyd 2>/dev/null || true
-  fi
-
-  info "等待 chrony 锁定 NTP 源（最多 15 秒）..."
-  local j=1
-  while [ "$j" -le 15 ]; do
-    sleep 1
-    local sources
-    sources=$(chronyc sources 2>/dev/null | grep '^\^\*' || true)
-    if [ -n "$sources" ]; then
-      success "chrony 已锁定 NTP 源"
-      break
-    fi
-    j=$((j + 1))
-  done
-
-  if chronyc makestep &>/dev/null; then
-    return 0
-  else
-    local offset
-    offset=$(chronyc tracking 2>/dev/null | grep "System time" | grep -oP '[\d.]+' | head -1 || echo "")
-    if [ -n "$offset" ]; then
-      info "当前时钟偏差: ${offset} 秒"
-      return 0
-    fi
-    return 1
-  fi
-}
-
-# ---------- timesyncd 同步 ----------
-sync_with_timesyncd() {
-  info "启动 systemd-timesyncd 服务..."
-  systemctl unmask systemd-timesyncd 2>/dev/null || true
-  systemctl enable --now systemd-timesyncd 2>/dev/null || true
-  timedatectl set-ntp true 2>/dev/null || true
-
-  info "等待 timesyncd 同步（最多 20 秒）..."
-  local i=1
-  while [ "$i" -le 20 ]; do
-    sleep 1
-    local ntp_status
-    ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "")
-    if [ "$ntp_status" = "yes" ]; then
-      success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
-      return 0
-    fi
-    i=$((i + 1))
-  done
-
-  warn "systemd-timesyncd 同步等待超时（20 秒）"
-  return 1
-}
-
-# ---------- ntpdate 同步 + crontab ----------
-sync_with_ntpdate() {
-  if ntpdate -u pool.ntp.org 2>/dev/null; then
-    info "设置 crontab 每小时自动同步..."
-    local ntpdate_path
-    ntpdate_path=$(command -v ntpdate)
-    local cron_line="0 * * * * ${ntpdate_path} -u pool.ntp.org >/dev/null 2>&1"
-    if crontab -l 2>/dev/null | grep -qF "ntpdate"; then
-      info "crontab 中已存在 ntpdate 任务，跳过"
-    else
-      if (crontab -l 2>/dev/null; echo "$cron_line") | crontab - 2>/dev/null; then
-        success "已添加 crontab: 每小时自动同步"
-      else
-        warn "crontab 添加失败，请手动设置定时同步"
-      fi
-    fi
-    return 0
-  else
-    return 1
-  fi
-}
-
-# =========================================================================
-# 关闭 set -e 进入同步 + 报告阶段
-# =========================================================================
-sync_and_report() {
-  set +e
-  set +o pipefail
-
-  local target_tz="$1"
-  local sync_ok=false
-  local sync_method=""
-
-  # ==================== 平台检测 ====================
-  local platform_info os_name os_ver pkg_mgr arch init_sys
-  platform_info=$(detect_platform)
-  os_name=$(echo "$platform_info"  | cut -d'|' -f1)
-  os_ver=$(echo "$platform_info"   | cut -d'|' -f2)
-  pkg_mgr=$(echo "$platform_info"  | cut -d'|' -f3)
-  arch=$(echo "$platform_info"     | cut -d'|' -f4)
-  init_sys=$(echo "$platform_info" | cut -d'|' -f5)
-
-  echo "" >&2
-  echo -e "${BOLD}------------ 系统平台信息 ------------${RESET}" >&2
-  echo -e "  操作系统  : ${CYAN}${os_name} ${os_ver}${RESET}" >&2
-  echo -e "  系统架构  : ${CYAN}${arch}${RESET}" >&2
-  echo -e "  包管理器  : ${CYAN}${pkg_mgr}${RESET}" >&2
-  echo -e "  Init 系统 : ${CYAN}${init_sys}${RESET}" >&2
-  echo -e "${BOLD}--------------------------------------${RESET}" >&2
-  echo "" >&2
-
-  # ==================== NTP 工具检测 ====================
-  info "检测 NTP 同步工具..."
-  local has_chrony=false has_ntpdate=false has_timesyncd=false
-  local need_install=false
-
-  if command -v chronyc &>/dev/null; then
-    has_chrony=true
-    local chrony_ver
-    chrony_ver=$(chronyc -v 2>/dev/null | head -1 || echo "")
-    success "chronyc     ✔ 已安装  ${chrony_ver}"
-  else
-    warn "chronyc     ✘ 未安装"
-  fi
-
-  if command -v ntpdate &>/dev/null; then
-    has_ntpdate=true
-    success "ntpdate     ✔ 已安装 ($(command -v ntpdate))"
-  else
-    warn "ntpdate     ✘ 未安装"
-  fi
-
-  if command -v timedatectl &>/dev/null; then
-    local ntp_svc
-    ntp_svc=$(timedatectl status 2>/dev/null | grep -i "NTP service" || true)
-    if echo "$ntp_svc" | grep -qi "n/a"; then
-      warn "timesyncd   ✘ 未安装（NTP service: n/a）"
-    elif echo "$ntp_svc" | grep -qi "inactive"; then
-      warn "timesyncd   ○ 已安装但未启用"
-      has_timesyncd=true
-    else
-      has_timesyncd=true
-      success "timesyncd   ✔ 可用"
-    fi
-  fi
-
-  if ! $has_chrony && ! $has_ntpdate && ! $has_timesyncd; then
-    need_install=true
-  fi
-
-  if $DRY_RUN; then
-    info "[dry-run] 将执行网络时间同步"
-    if $need_install; then
-      info "[dry-run] 检测到缺少 NTP 工具，将提示安装"
-    fi
-  else
-    info "正在同步网络时间..."
-
-    # ---- 1. chrony（已安装） ----
-    if $has_chrony; then
-      info "使用已安装的 chrony 同步..."
-      if sync_with_chrony; then
-        sync_ok=true
-        sync_method="chrony"
-        success "chrony 时间同步完成"
-      else
-        warn "chrony 同步失败"
-      fi
-    fi
-
-    # ---- 2. ntpdate（已安装） ----
-    if ! $sync_ok && $has_ntpdate; then
-      info "使用已安装的 ntpdate 同步..."
-      if sync_with_ntpdate; then
-        sync_ok=true
-        sync_method="ntpdate"
-        success "ntpdate 时间同步完成"
-      else
-        warn "ntpdate 同步失败"
-      fi
-    fi
-
-    # ---- 3. timesyncd（已安装） ----
-    if ! $sync_ok && $has_timesyncd; then
-      info "使用已安装的 systemd-timesyncd 同步..."
-      if sync_with_timesyncd; then
-        sync_ok=true
-        sync_method="systemd-timesyncd"
-      else
-        warn "systemd-timesyncd 同步失败"
-      fi
-    fi
-
-    # ---- 4. 无可用工具 → 选择安装 ----
-    if ! $sync_ok && $need_install; then
-      echo "" >&2
-      warn "系统中没有可用的 NTP 时间同步工具"
-
-      local chosen_tool
-      chosen_tool=$(select_ntp_tool "$init_sys")
-
-      echo "" >&2
-      echo -e "${BOLD}------------ 安装信息 ----------------${RESET}" >&2
-      echo -e "  安装平台  : ${CYAN}${os_name} ${os_ver} (${arch})${RESET}" >&2
-      echo -e "  包管理器  : ${CYAN}${pkg_mgr}${RESET}" >&2
-      echo -e "  安装工具  : ${GREEN}${chosen_tool}${RESET}" >&2
-      echo -e "${BOLD}--------------------------------------${RESET}" >&2
-      echo "" >&2
-
-      if install_ntp_tool "$chosen_tool" "$pkg_mgr"; then
-        case "$chosen_tool" in
-          chrony)
-            if command -v chronyc &>/dev/null; then
-              if sync_with_chrony; then
-                sync_ok=true
-                sync_method="chrony（自动安装 via ${pkg_mgr}）"
-                success "chrony 时间同步完成"
-              else
-                warn "chrony 已安装但同步未确认"
-              fi
-            fi
-            ;;
-          timesyncd)
-            if sync_with_timesyncd; then
-              sync_ok=true
-              sync_method="systemd-timesyncd（自动安装 via ${pkg_mgr}）"
-              success "systemd-timesyncd 时间同步完成"
-            else
-              warn "timesyncd 已安装但同步未确认"
-            fi
-            ;;
-          ntpdate)
-            if command -v ntpdate &>/dev/null; then
-              if sync_with_ntpdate; then
-                sync_ok=true
-                sync_method="ntpdate（自动安装 via ${pkg_mgr}）"
-                success "ntpdate 时间同步完成"
-              else
-                warn "ntpdate 已安装但同步失败"
-              fi
-            fi
-            ;;
+    if [[ "$installed" == "false" ]]; then
+        warn "chrony 未安装，正在安装..."
+        $PKG_UPDATE &>/dev/null
+        case "$PKG_MGR" in
+            apt)    $PKG_INSTALL chrony ;;
+            yum|dnf) $PKG_INSTALL chrony ;;
+            apk)    $PKG_INSTALL chrony ;;
+            pacman) $PKG_INSTALL chrony ;;
         esac
-      else
-        warn "${chosen_tool} 安装失败"
-      fi
+        info "chrony 安装完成"
     fi
 
-    # ---- 5. 终极回退：HTTP 响应头强制校时 ----
-    if ! $sync_ok; then
-      echo "" >&2
-      info "所有 NTP 方式均失败，尝试 HTTP 响应头校时（最后手段）..."
-      local http_date=""
-      if command -v curl &>/dev/null; then
-        http_date=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
-          | grep -i "^date:" | sed 's/^[Dd]ate: *//' | tr -d '\r')
-      fi
-      if [ -z "$http_date" ] && command -v wget &>/dev/null; then
-        http_date=$(wget -qS --spider --timeout=5 "https://www.google.com" 2>&1 \
-          | grep -i "Date:" | head -1 | sed 's/.*Date: *//' | tr -d '\r')
-      fi
+    # 停止冲突服务
+    systemctl stop systemd-timesyncd 2>/dev/null || true
+    systemctl disable systemd-timesyncd 2>/dev/null || true
 
-      if [ -n "$http_date" ]; then
-        info "HTTP 服务器时间: ${http_date}"
-        if date -s "$http_date" &>/dev/null; then
-          sync_ok=true
-          sync_method="HTTP 响应头（date -s）"
-          success "已通过 HTTP 响应头校准系统时间"
-        else
-          local epoch
-          epoch=$(date -d "$http_date" +%s 2>/dev/null || true)
-          if [ -n "$epoch" ]; then
-            date -s "@${epoch}" &>/dev/null
-            sync_ok=true
-            sync_method="HTTP 响应头（epoch）"
-            success "已通过 HTTP 响应头校准系统时间"
-          else
-            warn "HTTP 时间格式无法解析"
-          fi
-        fi
-      else
-        warn "无法获取 HTTP 服务器时间"
-      fi
-    fi
-
-    # ---- 同步后写入硬件时钟 ----
-    if $sync_ok && command -v hwclock &>/dev/null; then
-      hwclock -w 2>/dev/null && info "已同步写入硬件时钟（RTC）" || true
-    fi
-  fi
-
-  # ==================== 结果汇总 ====================
-  echo "" >&2
-  echo -e "${BOLD}╔══════════════════════════════════════════════════╗${RESET}" >&2
-  echo -e "${BOLD}║              时区校准结果汇总                    ║${RESET}" >&2
-  echo -e "${BOLD}╠══════════════════════════════════════════════════╣${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  系统平台  : ${CYAN}${os_name} ${os_ver} (${arch})${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  Init 系统 : ${CYAN}${init_sys}${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  包管理器  : ${CYAN}${pkg_mgr}${RESET}" >&2
-  echo -e "${BOLD}║${RESET}  校准时区  : ${GREEN}${target_tz}${RESET}" >&2
-
-  if ! $DRY_RUN; then
-    local local_time utc_time
-    local_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
-    utc_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-    echo -e "${BOLD}║${RESET}  本地时间  : ${GREEN}${local_time}${RESET}" >&2
-    echo -e "${BOLD}║${RESET}  UTC 时间  : ${utc_time}" >&2
-
-    if $sync_ok; then
-      echo -e "${BOLD}║${RESET}  同步状态  : ${GREEN}✔ 已同步（${sync_method}）${RESET}" >&2
+    # 配置 chrony
+    local chrony_conf
+    if [[ -f /etc/chrony/chrony.conf ]]; then
+        chrony_conf="/etc/chrony/chrony.conf"
+    elif [[ -f /etc/chrony.conf ]]; then
+        chrony_conf="/etc/chrony.conf"
     else
-      echo -e "${BOLD}║${RESET}  同步状态  : ${YELLOW}✘ 未同步${RESET}" >&2
+        chrony_conf="/etc/chrony/chrony.conf"
+        mkdir -p /etc/chrony
     fi
 
-    # 网络参考时间
-    local net_time=""
-    if command -v curl &>/dev/null; then
-      net_time=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
-        | grep -i "^date:" | sed 's/^[Dd]ate: *//' | tr -d '\r')
-    fi
-    if [ -z "$net_time" ] && command -v wget &>/dev/null; then
-      net_time=$(wget -qS --spider --timeout=5 "https://www.google.com" 2>&1 \
-        | grep -i "Date:" | head -1 | sed 's/.*Date: *//' | tr -d '\r')
-    fi
+    info "备份并写入 chrony 配置: $chrony_conf"
+    [[ -f "$chrony_conf" ]] && cp "$chrony_conf" "${chrony_conf}.bak.$(date +%s)"
 
-    if [ -n "$net_time" ]; then
-      local net_epoch local_epoch diff_sec=""
-      net_epoch=$(date -d "$net_time" +%s 2>/dev/null || true)
-      local_epoch=$(date +%s 2>/dev/null || true)
-      if [ -n "$net_epoch" ] && [ -n "$local_epoch" ]; then
-        diff_sec=$((local_epoch - net_epoch))
-        if [ "$diff_sec" -lt 0 ] 2>/dev/null; then
-          diff_sec=$(( -diff_sec ))
-        fi
-      fi
+    cat > "$chrony_conf" <<EOF
+# VPS 时间同步配置 - 自动生成于 $(date)
+# NTP 服务器池
+server pool.ntp.org        iburst
+server time.cloudflare.com iburst
+server time.google.com     iburst
+server time.apple.com      iburst
+server ntp.aliyun.com      iburst
 
-      echo -e "${BOLD}║${RESET}  网络参考  : ${CYAN}${net_time}${RESET}" >&2
-      if [ -n "$diff_sec" ]; then
-        if [ "$diff_sec" -le 2 ]; then
-          echo -e "${BOLD}║${RESET}  时间偏差  : ${GREEN}≤ ${diff_sec} 秒 ✔ 精准${RESET}" >&2
-        elif [ "$diff_sec" -le 10 ]; then
-          echo -e "${BOLD}║${RESET}  时间偏差  : ${YELLOW}约 ${diff_sec} 秒（可接受）${RESET}" >&2
-        else
-          echo -e "${BOLD}║${RESET}  时间偏差  : ${RED}约 ${diff_sec} 秒（偏差较大！）${RESET}" >&2
-        fi
-      fi
-    fi
+# 如果时间偏差超过1秒，前3次同步允许跳变
+makestep 1.0 3
 
-    echo -e "${BOLD}╠══════════════════════════════════════════════════╣${RESET}" >&2
-    echo -e "${BOLD}║${RESET}  ${BOLD}[ NTP 工具最终状态 ]${RESET}" >&2
+# 记录时间偏移
+driftfile /var/lib/chrony/drift
 
-    if command -v chronyc &>/dev/null; then
-      local chrony_svc_status
-      chrony_svc_status=$(systemctl is-active chronyd 2>/dev/null || echo "unknown")
-      echo -e "${BOLD}║${RESET}    chrony:      ${GREEN}已安装${RESET} | 服务: ${chrony_svc_status}" >&2
-    else
-      echo -e "${BOLD}║${RESET}    chrony:      ${YELLOW}未安装${RESET}" >&2
-    fi
+# 开启 RTC 同步
+rtcsync
 
-    if command -v ntpdate &>/dev/null; then
-      echo -n -e "${BOLD}║${RESET}    ntpdate:     ${GREEN}已安装${RESET}" >&2
-      if crontab -l 2>/dev/null | grep -qF "ntpdate"; then
-        echo -e " | ${GREEN}crontab 每小时同步 ✔${RESET}" >&2
-      else
-        echo -e " | ${YELLOW}无定时任务${RESET}" >&2
-      fi
-    else
-      echo -e "${BOLD}║${RESET}    ntpdate:     ${YELLOW}未安装${RESET}" >&2
-    fi
+# 日志
+logdir /var/log/chrony
+EOF
 
-    local final_ntp_svc
-    final_ntp_svc=$(timedatectl status 2>/dev/null | grep -i "NTP service" | sed 's/.*: *//' || echo "unknown")
-    local final_synced
-    final_synced=$(timedatectl status 2>/dev/null | grep -i "synchronized" | sed 's/.*: *//' || echo "unknown")
-    echo -e "${BOLD}║${RESET}    NTP service:  ${final_ntp_svc}" >&2
-    echo -e "${BOLD}║${RESET}    Clock synced: ${final_synced}" >&2
+    # 启动服务
+    systemctl enable chronyd 2>/dev/null || systemctl enable chrony 2>/dev/null
+    systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null
 
-    if command -v timedatectl &>/dev/null; then
-      echo -e "${BOLD}╠══════════════════════════════════════════════════╣${RESET}" >&2
-      echo -e "${BOLD}║${RESET}  ${BOLD}[ timedatectl 完整状态 ]${RESET}" >&2
-      timedatectl status 2>/dev/null | while IFS= read -r line; do
-        echo -e "${BOLD}║${RESET}    $line" >&2
-      done
-    fi
-  else
-    echo -e "${BOLD}║${RESET}  同步状态  : ${YELLOW}dry-run 模式，未执行${RESET}" >&2
-  fi
+    sleep 2
 
-  echo -e "${BOLD}╚══════════════════════════════════════════════════╝${RESET}" >&2
+    info "chrony 同步状态:"
+    divider
+    chronyc tracking 2>/dev/null || true
+    echo ""
+    chronyc sources -v 2>/dev/null || true
+    divider
+
+    SYNC_TOOL="chrony"
 }
 
-# ---------- 主流程 ----------
+# ---------- ntpdate ----------
+setup_ntpdate() {
+    local installed=$1
+    info "选择了 ntpdate"
+
+    if [[ "$installed" == "false" ]]; then
+        warn "ntpdate 未安装，正在安装..."
+        $PKG_UPDATE &>/dev/null
+        case "$PKG_MGR" in
+            apt)    $PKG_INSTALL ntpdate ;;
+            yum|dnf) $PKG_INSTALL ntpdate ;;
+            apk)    $PKG_INSTALL ntpdate ;;  # Alpine 可能在 openntpd 包中
+            pacman) $PKG_INSTALL ntp ;;
+        esac
+        info "ntpdate 安装完成"
+    fi
+
+    # 停止可能冲突的 NTP 守护进程
+    systemctl stop chronyd 2>/dev/null || true
+    systemctl stop ntp 2>/dev/null || true
+    systemctl stop ntpd 2>/dev/null || true
+    systemctl stop systemd-timesyncd 2>/dev/null || true
+
+    info "正在通过 ntpdate 同步时间..."
+    divider
+    local synced=false
+    for server in "${NTP_SERVERS[@]}"; do
+        echo -e "  尝试服务器: ${CYAN}${server}${NC}"
+        if ntpdate -u "$server" 2>&1; then
+            synced=true
+            info "成功从 ${server} 同步时间"
+            break
+        fi
+    done
+    divider
+
+    if ! $synced; then
+        warn "所有 NTP 服务器均失败，将在第三步使用 HTTP 时间"
+    fi
+
+    SYNC_TOOL="ntpdate"
+}
+
+# ---------- systemd-timesyncd ----------
+setup_timesyncd() {
+    local installed=$1
+    info "选择了 systemd-timesyncd"
+
+    if [[ "$installed" == "false" ]]; then
+        warn "systemd-timesyncd 未安装，正在安装..."
+        $PKG_UPDATE &>/dev/null
+        case "$PKG_MGR" in
+            apt)    $PKG_INSTALL systemd-timesyncd ;;
+            yum|dnf)
+                warn "CentOS/RHEL 默认不提供 timesyncd，建议使用 chrony"
+                error "无法在当前系统安装 timesyncd，请选择其他工具"
+                select_sync_tool
+                return
+                ;;
+            apk)
+                warn "Alpine 不支持 systemd-timesyncd，请选择其他工具"
+                select_sync_tool
+                return
+                ;;
+            pacman) $PKG_INSTALL systemd ;;
+        esac
+    fi
+
+    # 停止冲突服务
+    systemctl stop chronyd 2>/dev/null || true
+    systemctl disable chronyd 2>/dev/null || true
+    systemctl stop ntp 2>/dev/null || true
+    systemctl disable ntp 2>/dev/null || true
+
+    # 配置 timesyncd
+    local conf_dir="/etc/systemd/timesyncd.conf.d"
+    mkdir -p "$conf_dir"
+
+    cat > "${conf_dir}/custom-ntp.conf" <<EOF
+# VPS 时间同步配置 - 自动生成于 $(date)
+[Time]
+NTP=time.cloudflare.com time.google.com pool.ntp.org
+FallbackNTP=time.apple.com ntp.aliyun.com
+EOF
+
+    # 启动服务
+    systemctl enable systemd-timesyncd
+    systemctl restart systemd-timesyncd
+
+    # 启用 NTP 同步
+    timedatectl set-ntp true 2>/dev/null || true
+
+    sleep 2
+
+    info "timesyncd 同步状态:"
+    divider
+    timedatectl timesync-status 2>/dev/null || timedatectl status 2>/dev/null
+    divider
+
+    SYNC_TOOL="timesyncd"
+}
+
+# ==================== 第三步：从 HTTP 大站获取时间验证/校准 ====================
+http_time_sync() {
+    header "第三步：从 HTTP 大站获取网络时间验证"
+
+    local sites=(
+        "https://www.apple.com"
+        "https://www.cloudflare.com"
+        "https://www.google.com"
+        "https://www.microsoft.com"
+        "https://www.baidu.com"
+    )
+
+    local http_times=()
+    local epoch_times=()
+
+    echo ""
+    echo -e "${BOLD}从各大站 HTTP 响应头获取 Date 时间：${NC}"
+    divider
+
+    for site in "${sites[@]}"; do
+        local date_header
+        date_header=$(curl -sI --max-time 5 "$site" 2>/dev/null | grep -i "^date:" | sed 's/[Dd]ate: //' | tr -d '\r')
+        if [[ -n "$date_header" ]]; then
+            # 转换为 epoch
+            local epoch
+            epoch=$(date -d "$date_header" +%s 2>/dev/null)
+            local local_fmt
+            local_fmt=$(date -d "$date_header" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null)
+
+            printf "  %-30s │ %s\n" "$site" "${GREEN}${date_header}${NC}"
+            if [[ -n "$epoch" ]]; then
+                epoch_times+=("$epoch")
+                http_times+=("$date_header")
+            fi
+        else
+            printf "  %-30s │ %s\n" "$site" "${RED}获取失败${NC}"
+        fi
+    done
+    divider
+
+    if [[ ${#epoch_times[@]} -eq 0 ]]; then
+        error "无法从任何网站获取时间，跳过 HTTP 校时"
+        return
+    fi
+
+    # 计算中位数时间（排序取中间值，避免异常值干扰）
+    IFS=$'\n' sorted_epochs=($(sort -n <<<"${epoch_times[*]}")); unset IFS
+    local mid_idx=$(( ${#sorted_epochs[@]} / 2 ))
+    local median_epoch="${sorted_epochs[$mid_idx]}"
+    local median_time
+    median_time=$(date -d "@${median_epoch}" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null)
+
+    local current_epoch
+    current_epoch=$(date +%s)
+    local drift=$(( current_epoch - median_epoch ))
+    local abs_drift=${drift#-}
+
+    echo ""
+    echo -e "  HTTP 中位数时间: ${BOLD}${median_time}${NC}  (epoch: ${median_epoch})"
+    echo -e "  当前系统时间:    ${BOLD}$(date "+%Y-%m-%d %H:%M:%S %Z")${NC}  (epoch: ${current_epoch})"
+    echo -e "  时间偏差:        ${BOLD}${drift} 秒${NC}"
+    echo ""
+
+    if [[ $abs_drift -gt 3 ]]; then
+        warn "系统时间与网络时间偏差超过 3 秒 (${drift}s)"
+        read -rp "$(echo -e "${CYAN}是否使用 HTTP 获取的时间强制校准系统时钟？[Y/n]: ${NC}")" force_sync
+        force_sync="${force_sync:-Y}"
+
+        if [[ "$force_sync" =~ ^[Yy]$ ]]; then
+            # 使用中位数时间来设置
+            local set_time
+            set_time=$(date -d "@${median_epoch}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+
+            # 先尝试用 date 命令直接设置
+            if date -s "$set_time" &>/dev/null; then
+                info "系统时间已通过 HTTP 时间校准为: $(date "+%Y-%m-%d %H:%M:%S %Z")"
+            elif timedatectl set-time "$set_time" &>/dev/null; then
+                info "系统时间已通过 timedatectl 校准为: $(date "+%Y-%m-%d %H:%M:%S %Z")"
+            else
+                error "无法设置系统时间，请手动执行: date -s '${set_time}'"
+            fi
+
+            # 同步到硬件时钟
+            if command -v hwclock &>/dev/null; then
+                hwclock -w 2>/dev/null && info "已同步到硬件时钟 (RTC)"
+            fi
+        fi
+    else
+        info "系统时间与网络时间偏差在 3 秒以内，无需额外校准 ✓"
+    fi
+}
+
+# ==================== 最终汇总 ====================
+show_summary() {
+    header "校准完成 — 最终状态"
+
+    echo ""
+    echo -e "  ${BOLD}时区:${NC}         $(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "$DETECTED_TZ")"
+    echo -e "  ${BOLD}校时工具:${NC}     ${SYNC_TOOL}"
+    echo -e "  ${BOLD}当前时间:${NC}     $(date "+%Y-%m-%d %H:%M:%S %Z")"
+    echo -e "  ${BOLD}UTC 时间:${NC}     $(date -u "+%Y-%m-%d %H:%M:%S UTC")"
+    echo -e "  ${BOLD}Epoch:${NC}        $(date +%s)"
+
+    if command -v hwclock &>/dev/null; then
+        echo -e "  ${BOLD}硬件时钟:${NC}     $(hwclock --show 2>/dev/null || echo 'N/A')"
+    fi
+
+    echo ""
+
+    # timedatectl 完整输出
+    if command -v timedatectl &>/dev/null; then
+        divider
+        timedatectl status
+        divider
+    fi
+
+    echo ""
+    info "所有操作完成！"
+    echo ""
+}
+
+# ==================== 主流程 ====================
 main() {
-  echo "" >&2
-  echo -e "${BOLD}========== VPS 时区自动校准脚本 v2.7 ==========${RESET}" >&2
-  $DRY_RUN && warn "dry-run 模式：仅检测，不修改系统"
-  echo "" >&2
+    echo ""
+    echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${BLUE}║   VPS 时区与时间自动校准脚本 v1.0       ║${NC}"
+    echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
 
-  local target_tz=""
+    check_root
+    detect_pkg_manager
 
-  if [[ -n "$FORCE_TZ" ]]; then
-    info "使用强制指定时区: ${FORCE_TZ}"
-    target_tz="$FORCE_TZ"
-  else
-    target_tz=$(detect_timezone)
-  fi
+    # 第一步：检测并设置时区
+    detect_timezone_by_ip
 
-  info "目标时区: ${target_tz}"
+    # 第二步：选择并配置校时工具
+    select_sync_tool
 
-  local current_tz=""
-  current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
-  [[ -z "$current_tz" ]] && current_tz=$(cat /etc/timezone 2>/dev/null || true)
-  [[ -z "$current_tz" ]] && current_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
-  [[ -z "$current_tz" ]] && current_tz="unknown"
+    # 第三步：HTTP 时间验证/校准
+    http_time_sync
 
-  if [[ "$current_tz" == "$target_tz" ]]; then
-    success "当前时区 [${current_tz}] 已与目标一致，无需修改"
-  else
-    info "当前时区: ${current_tz} → 目标时区: ${target_tz}"
-    apply_timezone "$target_tz"
-  fi
-
-  sync_and_report "$target_tz"
-
-  trap - EXIT
-  exit 0
+    # 汇总
+    show_summary
 }
 
 main "$@"
