@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VPS 时区自动校准脚本 v2.4
+# VPS 时区自动校准脚本 v2.5
 # 根据公网 IP 归属地自动识别所在时区并完成校准
-# 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
+# 支持：Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等主流发行版
 # 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
 # =============================================================================
 
@@ -57,6 +57,42 @@ http_get() {
   else
     wget -qO- --timeout=8 "$url" 2>/dev/null
   fi
+}
+
+# ---------- 平台检测 ----------
+detect_platform() {
+  local os_name="" os_ver="" pkg_mgr="" arch=""
+  arch=$(uname -m 2>/dev/null || echo "unknown")
+
+  if [ -f /etc/os-release ]; then
+    os_name=$(. /etc/os-release && echo "${NAME:-unknown}")
+    os_ver=$(. /etc/os-release && echo "${VERSION_ID:-}")
+  elif [ -f /etc/redhat-release ]; then
+    os_name=$(cat /etc/redhat-release)
+  elif [ -f /etc/alpine-release ]; then
+    os_name="Alpine"
+    os_ver=$(cat /etc/alpine-release)
+  else
+    os_name=$(uname -s)
+  fi
+
+  if command -v apt-get &>/dev/null; then
+    pkg_mgr="apt"
+  elif command -v dnf &>/dev/null; then
+    pkg_mgr="dnf"
+  elif command -v yum &>/dev/null; then
+    pkg_mgr="yum"
+  elif command -v apk &>/dev/null; then
+    pkg_mgr="apk"
+  elif command -v pacman &>/dev/null; then
+    pkg_mgr="pacman"
+  elif command -v zypper &>/dev/null; then
+    pkg_mgr="zypper"
+  else
+    pkg_mgr="unknown"
+  fi
+
+  echo "${os_name}|${os_ver}|${pkg_mgr}|${arch}"
 }
 
 # ---------- 国家 → 时区回退表 ----------
@@ -164,7 +200,7 @@ apply_timezone() {
 }
 
 # =========================================================================
-# 关闭 set -e，进入时间同步 + 报告阶段
+# 关闭 set -e 进入时间同步 + 报告阶段
 # =========================================================================
 sync_and_report() {
   set +e
@@ -174,17 +210,59 @@ sync_and_report() {
   local sync_ok=false
   local sync_method=""
 
+  # ==================== 平台检测 ====================
+  local platform_info os_name os_ver pkg_mgr arch
+  platform_info=$(detect_platform)
+  os_name=$(echo "$platform_info" | cut -d'|' -f1)
+  os_ver=$(echo "$platform_info"  | cut -d'|' -f2)
+  pkg_mgr=$(echo "$platform_info" | cut -d'|' -f3)
+  arch=$(echo "$platform_info"    | cut -d'|' -f4)
+
+  echo "" >&2
+  echo -e "${BOLD}------------ 系统平台信息 ------------${RESET}" >&2
+  echo -e "  操作系统  : ${CYAN}${os_name} ${os_ver}${RESET}" >&2
+  echo -e "  系统架构  : ${CYAN}${arch}${RESET}" >&2
+  echo -e "  包管理器  : ${CYAN}${pkg_mgr}${RESET}" >&2
+  echo -e "${BOLD}--------------------------------------${RESET}" >&2
+  echo "" >&2
+
+  # ==================== NTP 工具检测 ====================
+  info "检测 NTP 同步工具..."
+  local has_chrony=false has_ntpdate=false has_timesyncd=false
+
+  if command -v chronyc &>/dev/null; then
+    has_chrony=true
+    success "chronyc     ✔ 已安装 ($(command -v chronyc))"
+  else
+    warn "chronyc     ✘ 未安装"
+  fi
+
+  if command -v ntpdate &>/dev/null; then
+    has_ntpdate=true
+    success "ntpdate     ✔ 已安装 ($(command -v ntpdate))"
+  else
+    warn "ntpdate     ✘ 未安装"
+  fi
+
+  if command -v timedatectl &>/dev/null; then
+    local ntp_svc
+    ntp_svc=$(timedatectl status 2>/dev/null | grep -i "NTP service" || true)
+    if echo "$ntp_svc" | grep -qi "n/a"; then
+      warn "timesyncd   ✘ 未安装（NTP service: n/a）"
+    else
+      has_timesyncd=true
+      success "timesyncd   ✔ 可用"
+    fi
+  fi
+
   if $DRY_RUN; then
     info "[dry-run] 将执行网络时间同步"
   else
     info "正在同步网络时间..."
-    local tried_any=false
 
     # ---- 1. chrony（已安装） ----
-    if command -v chronyc &>/dev/null; then
-      tried_any=true
-      info "检测到 chrony，尝试同步..."
-      # 确保 chronyd 在运行
+    if $has_chrony; then
+      info "使用 chrony 同步..."
       systemctl start chronyd 2>/dev/null || service chronyd start 2>/dev/null || true
       sleep 1
       if chronyc makestep &>/dev/null; then
@@ -192,14 +270,13 @@ sync_and_report() {
         sync_method="chrony"
         success "chrony 时间同步完成"
       else
-        warn "chronyc makestep 失败"
+        warn "chronyc makestep 失败（chronyd 可能未正常运行）"
       fi
     fi
 
     # ---- 2. ntpdate（已安装） ----
-    if ! $sync_ok && command -v ntpdate &>/dev/null; then
-      tried_any=true
-      info "检测到 ntpdate，尝试同步..."
+    if ! $sync_ok && $has_ntpdate; then
+      info "使用 ntpdate 同步..."
       if ntpdate -u pool.ntp.org &>/dev/null; then
         sync_ok=true
         sync_method="ntpdate"
@@ -209,102 +286,135 @@ sync_and_report() {
       fi
     fi
 
-    # ---- 3. systemd-timesyncd（检查是否真正可用） ----
-    if ! $sync_ok && command -v timedatectl &>/dev/null; then
-      # 检查 NTP service 是否为 n/a（表示没有 NTP 后端）
-      local ntp_svc
-      ntp_svc=$(timedatectl status 2>/dev/null | grep -i "NTP service" || true)
-      if echo "$ntp_svc" | grep -qi "n/a"; then
-        warn "systemd-timesyncd 未安装（NTP service: n/a）"
-      else
-        tried_any=true
-        info "检测到 systemd-timesyncd，尝试同步..."
-        timedatectl set-ntp true 2>/dev/null
-        local i=1
-        while [ "$i" -le 15 ]; do
-          sleep 1
-          local ntp_status
-          ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "")
-          if [ "$ntp_status" = "yes" ]; then
-            sync_ok=true
-            sync_method="systemd-timesyncd（等待 ${i} 秒）"
-            success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
-            break
-          fi
-          i=$((i + 1))
-        done
-        if ! $sync_ok; then
-          warn "systemd-timesyncd 同步等待超时（15 秒）"
+    # ---- 3. systemd-timesyncd（可用） ----
+    if ! $sync_ok && $has_timesyncd; then
+      info "使用 systemd-timesyncd 同步..."
+      timedatectl set-ntp true 2>/dev/null
+      local i=1
+      while [ "$i" -le 15 ]; do
+        sleep 1
+        local ntp_status
+        ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "")
+        if [ "$ntp_status" = "yes" ]; then
+          sync_ok=true
+          sync_method="systemd-timesyncd（等待 ${i} 秒）"
+          success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
+          break
         fi
+        i=$((i + 1))
+      done
+      if ! $sync_ok; then
+        warn "systemd-timesyncd 同步等待超时（15 秒）"
       fi
     fi
 
-    # ---- 4. 没有可用 NTP 工具 → 自动安装 chrony ----
+    # ---- 4. 全部不可用 → 自动安装 chrony ----
     if ! $sync_ok; then
-      info "没有可用的 NTP 同步工具，尝试自动安装 chrony..."
+      echo "" >&2
+      info "没有可用的 NTP 工具，自动安装 chrony..."
+      echo -e "  ${BOLD}安装平台: ${CYAN}${os_name} ${os_ver}${RESET} | 包管理器: ${CYAN}${pkg_mgr}${RESET}" >&2
+      echo "" >&2
+
       local install_ok=false
 
-      if command -v apt-get &>/dev/null; then
-        info "使用 apt-get 安装 chrony..."
-        apt-get update -qq 2>/dev/null
-        if apt-get install -y -qq chrony 2>/dev/null; then
-          install_ok=true
-        fi
-      elif command -v yum &>/dev/null; then
-        info "使用 yum 安装 chrony..."
-        if yum install -y -q chrony 2>/dev/null; then
-          install_ok=true
-        fi
-      elif command -v dnf &>/dev/null; then
-        info "使用 dnf 安装 chrony..."
-        if dnf install -y -q chrony 2>/dev/null; then
-          install_ok=true
-        fi
-      elif command -v apk &>/dev/null; then
-        info "使用 apk 安装 chrony..."
-        if apk add --quiet chrony 2>/dev/null; then
-          install_ok=true
-        fi
-      elif command -v pacman &>/dev/null; then
-        info "使用 pacman 安装 chrony..."
-        if pacman -Sy --noconfirm chrony 2>/dev/null; then
-          install_ok=true
-        fi
-      fi
+      case "$pkg_mgr" in
+        apt)
+          info "[apt] 正在更新索引..."
+          apt-get update -qq 2>/dev/null
+          info "[apt] 正在安装 chrony..."
+          if apt-get install -y -qq chrony 2>/dev/null; then
+            install_ok=true
+          fi
+          ;;
+        dnf)
+          info "[dnf] 正在安装 chrony..."
+          if dnf install -y -q chrony 2>/dev/null; then
+            install_ok=true
+          fi
+          ;;
+        yum)
+          info "[yum] 正在安装 chrony..."
+          if yum install -y -q chrony 2>/dev/null; then
+            install_ok=true
+          fi
+          ;;
+        apk)
+          info "[apk] 正在安装 chrony..."
+          if apk add --quiet chrony 2>/dev/null; then
+            install_ok=true
+          fi
+          ;;
+        pacman)
+          info "[pacman] 正在安装 chrony..."
+          if pacman -Sy --noconfirm chrony 2>/dev/null; then
+            install_ok=true
+          fi
+          ;;
+        zypper)
+          info "[zypper] 正在安装 chrony..."
+          if zypper install -y chrony 2>/dev/null; then
+            install_ok=true
+          fi
+          ;;
+        *)
+          warn "未识别的包管理器 [${pkg_mgr}]，无法自动安装"
+          warn "请手动安装: chrony 或 ntpdate"
+          ;;
+      esac
 
       if $install_ok && command -v chronyc &>/dev/null; then
         success "chrony 安装成功"
+
         # 启动 chronyd
-        systemctl enable --now chronyd 2>/dev/null \
-          || service chronyd start 2>/dev/null \
-          || chronyd 2>/dev/null \
-          || true
-        info "等待 chrony 同步..."
-        sleep 3
+        info "正在启动 chronyd 服务..."
+        if command -v systemctl &>/dev/null; then
+          systemctl enable --now chronyd 2>/dev/null || true
+        elif command -v rc-service &>/dev/null; then
+          rc-service chronyd start 2>/dev/null || true
+          rc-update add chronyd default 2>/dev/null || true
+        else
+          chronyd 2>/dev/null || true
+        fi
+
+        info "等待 chrony 首次同步（最多 15 秒）..."
+        local j=1
+        while [ "$j" -le 15 ]; do
+          sleep 1
+          # 检查是否已同步到源
+          local sources
+          sources=$(chronyc sources 2>/dev/null | grep '^\^\*' || true)
+          if [ -n "$sources" ]; then
+            success "chrony 已锁定 NTP 源"
+            break
+          fi
+          j=$((j + 1))
+        done
+
         if chronyc makestep &>/dev/null; then
           sync_ok=true
-          sync_method="chrony（自动安装）"
+          sync_method="chrony（自动安装 via ${pkg_mgr}）"
           success "chrony 时间同步完成"
         else
-          warn "chrony 已安装但 makestep 失败，尝试等待自动同步..."
-          sleep 5
-          # 检查偏差
+          # makestep 可能在偏差很小时不需要跳步
           local offset
           offset=$(chronyc tracking 2>/dev/null | grep "System time" | grep -oP '[\d.]+' | head -1 || echo "")
           if [ -n "$offset" ]; then
-            info "当前时钟偏差: ${offset} 秒"
             sync_ok=true
             sync_method="chrony（自动安装，偏差 ${offset}s）"
+            info "当前时钟偏差: ${offset} 秒"
+          else
+            warn "chrony 已安装但同步结果未知"
           fi
         fi
-      else
-        warn "chrony 自动安装失败"
+      elif $install_ok; then
+        warn "chrony 包已安装但 chronyc 命令不可用"
       fi
     fi
 
-    # ---- 5. 终极回退：用 HTTP 响应头 date -s 强制校时 ----
+    # ---- 5. 终极回退：HTTP 响应头强制校时 ----
     if ! $sync_ok; then
-      info "尝试通过 HTTP 响应头校准系统时间（最后手段）..."
+      echo "" >&2
+      info "所有 NTP 方式均失败，尝试 HTTP 响应头校时（最后手段）..."
       local http_date=""
       if command -v curl &>/dev/null; then
         http_date=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
@@ -322,7 +432,6 @@ sync_and_report() {
           sync_method="HTTP 响应头（date -s）"
           success "已通过 HTTP 响应头校准系统时间"
         else
-          # 某些 busybox 的 date -s 格式不同，尝试转换
           local epoch
           epoch=$(date -d "$http_date" +%s 2>/dev/null || true)
           if [ -n "$epoch" ]; then
@@ -350,6 +459,8 @@ sync_and_report() {
   echo -e "${BOLD}============================================${RESET}" >&2
   echo -e "${BOLD}           时区校准结果汇总${RESET}" >&2
   echo -e "${BOLD}============================================${RESET}" >&2
+  echo -e "  系统平台  : ${CYAN}${os_name} ${os_ver} (${arch})${RESET}" >&2
+  echo -e "  包管理器  : ${CYAN}${pkg_mgr}${RESET}" >&2
   echo -e "  校准时区  : ${GREEN}${target_tz}${RESET}" >&2
 
   if ! $DRY_RUN; then
@@ -366,7 +477,7 @@ sync_and_report() {
       echo -e "  同步状态  : ${YELLOW}✘ 未同步${RESET}" >&2
     fi
 
-    # 获取网络参考时间用于对比
+    # 获取网络参考时间对比
     local net_time=""
     if command -v curl &>/dev/null; then
       net_time=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
@@ -378,13 +489,11 @@ sync_and_report() {
     fi
 
     if [ -n "$net_time" ]; then
-      # 计算偏差秒数
       local net_epoch local_epoch diff_sec=""
       net_epoch=$(date -d "$net_time" +%s 2>/dev/null || true)
       local_epoch=$(date +%s 2>/dev/null || true)
       if [ -n "$net_epoch" ] && [ -n "$local_epoch" ]; then
         diff_sec=$((local_epoch - net_epoch))
-        # 取绝对值
         if [ "$diff_sec" -lt 0 ] 2>/dev/null; then
           diff_sec=$(( -diff_sec ))
         fi
@@ -393,19 +502,38 @@ sync_and_report() {
       echo -e "  网络参考  : ${CYAN}${net_time}${RESET}" >&2
       if [ -n "$diff_sec" ]; then
         if [ "$diff_sec" -le 2 ]; then
-          echo -e "  时间偏差  : ${GREEN}≤ ${diff_sec} 秒（精准）${RESET}" >&2
+          echo -e "  时间偏差  : ${GREEN}≤ ${diff_sec} 秒 ✔ 精准${RESET}" >&2
         elif [ "$diff_sec" -le 10 ]; then
           echo -e "  时间偏差  : ${YELLOW}约 ${diff_sec} 秒（可接受）${RESET}" >&2
         else
-          echo -e "  时间偏差  : ${RED}约 ${diff_sec} 秒（偏差较大）${RESET}" >&2
+          echo -e "  时间偏差  : ${RED}约 ${diff_sec} 秒（偏差较大！）${RESET}" >&2
         fi
       fi
     fi
 
     echo -e "${BOLD}--------------------------------------------${RESET}" >&2
 
+    # NTP 工具最终状态
+    echo -e "  ${BOLD}[ NTP 工具状态 ]${RESET}" >&2
+    if command -v chronyc &>/dev/null; then
+      local chrony_status
+      chrony_status=$(systemctl is-active chronyd 2>/dev/null || echo "unknown")
+      echo -e "    chrony:      ${GREEN}已安装${RESET} | 服务: ${chrony_status}" >&2
+    else
+      echo -e "    chrony:      ${YELLOW}未安装${RESET}" >&2
+    fi
+    if command -v ntpdate &>/dev/null; then
+      echo -e "    ntpdate:     ${GREEN}已安装${RESET}" >&2
+    else
+      echo -e "    ntpdate:     ${YELLOW}未安装${RESET}" >&2
+    fi
+    local final_ntp_svc
+    final_ntp_svc=$(timedatectl status 2>/dev/null | grep -i "NTP service" | sed 's/.*: *//' || echo "unknown")
+    echo -e "    NTP service: ${final_ntp_svc}" >&2
+
     # timedatectl 详情
     if command -v timedatectl &>/dev/null; then
+      echo "" >&2
       echo -e "  ${BOLD}[ timedatectl 状态 ]${RESET}" >&2
       timedatectl status 2>/dev/null | while IFS= read -r line; do
         echo "    $line" >&2
@@ -421,7 +549,7 @@ sync_and_report() {
 # ---------- 主流程 ----------
 main() {
   echo "" >&2
-  echo -e "${BOLD}========== VPS 时区自动校准脚本 v2.4 ==========${RESET}" >&2
+  echo -e "${BOLD}========== VPS 时区自动校准脚本 v2.5 ==========${RESET}" >&2
   $DRY_RUN && warn "dry-run 模式：仅检测，不修改系统"
   echo "" >&2
 
