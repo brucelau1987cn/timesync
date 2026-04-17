@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VPS 时区自动校准脚本 v2.2
+# VPS 时区自动校准脚本 v2.3
 # 根据公网 IP 归属地自动识别所在时区并完成校准
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine 等主流发行版
 # 用法：bash tz-calibrate.sh [--dry-run] [--force TIMEZONE]
 # =============================================================================
 
 set -euo pipefail
+
+# ---------- 意外退出捕获（调试用） ----------
+trap 'echo -e "\033[0;31m[FATAL]\033[0m 脚本在第 $LINENO 行意外退出（退出码: $?）" >&2' EXIT
 
 # ---------- 颜色输出（全部输出到 stderr，避免污染命令替换） ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -29,6 +32,7 @@ while [[ $# -gt 0 ]]; do
       echo "用法: $0 [--dry-run] [--force TIMEZONE]"
       echo "  --dry-run          仅检测，不修改系统"
       echo "  --force TIMEZONE   强制使用指定时区，例如 Asia/Tokyo"
+      trap - EXIT
       exit 0 ;;
     *) die "未知参数: $1，使用 --help 查看帮助" ;;
   esac
@@ -101,7 +105,6 @@ detect_timezone() {
 
   local tz="" country="" ip="" city="" resp=""
 
-  # 尝试 ipinfo.io
   resp=$(http_get "https://ipinfo.io/json") || resp=""
   if [[ -n "$resp" ]]; then
     ip=$(echo "$resp"      | grep -oP '"ip"\s*:\s*"\K[^"]+' || true)
@@ -111,7 +114,6 @@ detect_timezone() {
     info "公网 IP: ${ip:-未知}  位置: ${city:-?}, ${country:-?}"
   fi
 
-  # 备用：ip-api.com
   if [[ -z "$tz" ]]; then
     warn "ipinfo.io 未返回时区，尝试 ip-api.com..."
     resp=$(http_get "http://ip-api.com/json?fields=status,countryCode,timezone,city,query") || resp=""
@@ -127,7 +129,6 @@ detect_timezone() {
     fi
   fi
 
-  # 国家代码回退表
   if [[ -z "$tz" && -n "$country" ]]; then
     warn "API 未返回时区字段，使用国家代码 [${country}] 查询回退表"
     tz="${COUNTRY_TZ[$country]:-}"
@@ -164,83 +165,125 @@ apply_timezone() {
   fi
 }
 
-# ---------- 同步网络时间（已修复 set -e 兼容性） ----------
-sync_time() {
+# =========================================================================
+# 从这里开始关闭 set -e，因为时间同步和结果展示中有太多可能返回非零的命令
+# =========================================================================
+sync_and_report() {
+  set +e   # ★ 彻底关闭 errexit，防止任何意外退出
+  set +o pipefail
+
+  local target_tz="$1"
+  local sync_ok=false
+  local sync_method=""
+
   if $DRY_RUN; then
     info "[dry-run] 将执行网络时间同步"
-    return
-  fi
+  else
+    info "正在同步网络时间..."
 
-  info "正在同步网络时间..."
-
-  # ---- chrony ----
-  if command -v chronyc &>/dev/null; then
-    if chronyc makestep &>/dev/null; then
-      success "chrony 时间同步完成"
-      info "同步后时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-      return
-    else
-      warn "chronyc makestep 执行失败，尝试其他方式..."
-    fi
-  fi
-
-  # ---- ntpdate ----
-  if command -v ntpdate &>/dev/null; then
-    if ntpdate -u pool.ntp.org &>/dev/null; then
-      success "ntpdate 时间同步完成"
-      info "同步后时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-      return
-    else
-      warn "ntpdate 执行失败，尝试其他方式..."
-    fi
-  fi
-
-  # ---- systemd-timesyncd ----
-  if command -v timedatectl &>/dev/null; then
-    timedatectl set-ntp true 2>/dev/null || true
-    # 修复：((i++)) 在 i=0 时返回 1，被 set -e 杀死
-    # 改用 i=$((i + 1)) 避免此问题
-    local i=0
-    while [[ $i -lt 10 ]]; do
-      sleep 1
-      i=$((i + 1))
-      if timedatectl show --property=NTPSynchronized 2>/dev/null | grep -q "yes"; then
-        success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
-        info "同步后时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        return
+    # ---- chrony ----
+    if command -v chronyc &>/dev/null; then
+      info "检测到 chrony，尝试同步..."
+      if chronyc makestep &>/dev/null; then
+        sync_ok=true
+        sync_method="chrony"
+        success "chrony 时间同步完成"
+      else
+        warn "chronyc makestep 失败（chronyd 可能未运行），尝试其他方式..."
       fi
-    done
-    warn "systemd-timesyncd 同步等待超时（10秒），时间可能仍有偏差"
-    info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    return
+    fi
+
+    # ---- ntpdate ----
+    if ! $sync_ok && command -v ntpdate &>/dev/null; then
+      info "检测到 ntpdate，尝试同步..."
+      if ntpdate -u pool.ntp.org &>/dev/null; then
+        sync_ok=true
+        sync_method="ntpdate"
+        success "ntpdate 时间同步完成"
+      else
+        warn "ntpdate 执行失败，尝试其他方式..."
+      fi
+    fi
+
+    # ---- systemd-timesyncd ----
+    if ! $sync_ok && command -v timedatectl &>/dev/null; then
+      info "检测到 systemd-timesyncd，尝试同步..."
+      timedatectl set-ntp true 2>/dev/null
+      local i=1
+      while [ "$i" -le 10 ]; do
+        sleep 1
+        local ntp_status
+        ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "")
+        if [ "$ntp_status" = "yes" ]; then
+          sync_ok=true
+          sync_method="systemd-timesyncd（等待 ${i} 秒）"
+          success "systemd-timesyncd 时间同步完成（等待 ${i} 秒）"
+          break
+        fi
+        i=$((i + 1))
+      done
+      if ! $sync_ok; then
+        warn "systemd-timesyncd 同步等待超时（10秒），时间可能仍有偏差"
+      fi
+    fi
+
+    # ---- 全部失败 ----
+    if ! $sync_ok && [ -z "$sync_method" ]; then
+      warn "未找到可用的时间同步工具（chrony / ntpdate / systemd-timesyncd）"
+      warn "建议安装: apt install chrony 或 yum install chrony"
+    fi
   fi
 
-  # ---- 尝试直接通过 HTTP 获取网络时间作参考 ----
-  warn "未找到 chrony / ntpdate / systemd-timesyncd"
-  info "当前系统时间: $(date '+%Y-%m-%d %H:%M:%S %Z')（未同步，可能有偏差）"
-}
-
-# ---------- 输出校准结果 ----------
-print_result() {
-  local tz="$1"
+  # ---------- 输出校准结果 ----------
   echo "" >&2
-  echo -e "${BOLD}========== 时区校准结果 ==========${RESET}" >&2
-  echo -e "  校准时区: ${GREEN}${tz}${RESET}" >&2
+  echo -e "${BOLD}============================================${RESET}" >&2
+  echo -e "${BOLD}           时区校准结果汇总${RESET}" >&2
+  echo -e "${BOLD}============================================${RESET}" >&2
+  echo -e "  校准时区  : ${GREEN}${target_tz}${RESET}" >&2
+
   if ! $DRY_RUN; then
-    echo -e "  当前时间: ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${RESET}" >&2
-    echo -e "  UTC  时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >&2
+    echo -e "  本地时间  : ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${RESET}" >&2
+    echo -e "  UTC 时间  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >&2
+
+    if $sync_ok; then
+      echo -e "  同步状态  : ${GREEN}✔ 已同步（${sync_method}）${RESET}" >&2
+    else
+      echo -e "  同步状态  : ${YELLOW}✘ 未同步或超时${RESET}" >&2
+    fi
+
+    # 获取网络参考时间（通过 HTTP 响应头）
+    local net_time=""
+    if command -v curl &>/dev/null; then
+      net_time=$(curl -sI --max-time 5 "https://www.google.com" 2>/dev/null \
+        | grep -i "^date:" | sed 's/^[Dd]ate: *//' | tr -d '\r')
+    fi
+    if [ -z "$net_time" ] && command -v wget &>/dev/null; then
+      net_time=$(wget -qS --spider --timeout=5 "https://www.google.com" 2>&1 \
+        | grep -i "Date:" | head -1 | sed 's/.*Date: *//' | tr -d '\r')
+    fi
+    if [ -n "$net_time" ]; then
+      echo -e "  网络时间  : ${CYAN}${net_time}${RESET}" >&2
+    fi
+
+    # timedatectl 详情
     if command -v timedatectl &>/dev/null; then
       echo "" >&2
-      timedatectl status 2>/dev/null | grep -E "(Local time|Time zone|NTP|synchronized)" | sed 's/^/  /' >&2 || true
+      echo -e "  ${BOLD}[ timedatectl 详情 ]${RESET}" >&2
+      timedatectl status 2>/dev/null | while IFS= read -r line; do
+        echo "    $line" >&2
+      done
     fi
+  else
+    echo -e "  同步状态  : ${YELLOW}dry-run 模式，未执行${RESET}" >&2
   fi
-  echo -e "${BOLD}==================================${RESET}" >&2
+
+  echo -e "${BOLD}============================================${RESET}" >&2
 }
 
 # ---------- 主流程 ----------
 main() {
   echo "" >&2
-  echo -e "${BOLD}========== VPS 时区自动校准脚本 ==========${RESET}" >&2
+  echo -e "${BOLD}========== VPS 时区自动校准脚本 v2.3 ==========${RESET}" >&2
   $DRY_RUN && warn "dry-run 模式：仅检测，不修改系统"
   echo "" >&2
 
@@ -255,7 +298,7 @@ main() {
 
   info "目标时区: ${target_tz}"
 
-  # 获取当前时区（每步都 || true 防止 set -e）
+  # 获取当前时区（每步 || true）
   local current_tz=""
   current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
   [[ -z "$current_tz" ]] && current_tz=$(cat /etc/timezone 2>/dev/null || true)
@@ -269,8 +312,12 @@ main() {
     apply_timezone "$target_tz"
   fi
 
-  sync_time
-  print_result "$target_tz"
+  # ★ 时间同步 + 结果展示（内部已关闭 set -e）
+  sync_and_report "$target_tz"
+
+  # 正常退出，清除 trap
+  trap - EXIT
+  exit 0
 }
 
 main "$@"
