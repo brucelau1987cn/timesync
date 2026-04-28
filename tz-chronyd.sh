@@ -3,10 +3,11 @@
 # ============================================================
 # VPS 时区和时间自动校准脚本
 # 根据公网 IP 归属地自动调整时区并同步时间
-# 使用 chronyd 工具同步
 # 支持：Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等主流发行版
 # 用法：bash tz-chronyd.sh
 # ============================================================
+
+set -euo pipefail
 
 # 颜色定义
 RED='\033[31m'
@@ -41,29 +42,48 @@ install_package() {
     local pkg="$1"
     log_info "正在安装 ${pkg}..."
 
+    local ret=0
+
     if command -v apt-get &>/dev/null; then
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq "$pkg" >/dev/null 2>&1
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq "$pkg" >/dev/null 2>&1 || ret=$?
     elif command -v yum &>/dev/null; then
-        yum install -y -q "$pkg" >/dev/null 2>&1
+        yum install -y -q "$pkg" >/dev/null 2>&1 || ret=$?
     elif command -v dnf &>/dev/null; then
-        dnf install -y -q "$pkg" >/dev/null 2>&1
+        dnf install -y -q "$pkg" >/dev/null 2>&1 || ret=$?
     elif command -v apk &>/dev/null; then
-        apk add --quiet "$pkg" >/dev/null 2>&1
+        apk add --quiet "$pkg" >/dev/null 2>&1 || ret=$?
     elif command -v pacman &>/dev/null; then
-        pacman -S --noconfirm --quiet "$pkg" >/dev/null 2>&1
+        pacman -S --noconfirm --quiet "$pkg" >/dev/null 2>&1 || ret=$?
     else
         log_error "未识别的包管理器，无法安装 ${pkg}"
         return 1
     fi
 
-    if [[ $? -eq 0 ]]; then
+    if [[ $ret -eq 0 ]] && command -v "$pkg" &>/dev/null; then
         log_ok "${pkg} 安装成功"
         return 0
     else
         log_error "${pkg} 安装失败"
         return 1
     fi
+}
+
+#================================================================
+# 验证 IPv4 地址格式
+#================================================================
+is_valid_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && \
+    [[ "$ip" != "0.0.0.0" ]] && \
+    [[ "$ip" != "127.0.0.1" ]]
+}
+
+#================================================================
+# 判断是否使用 systemd
+#================================================================
+has_systemd() {
+    systemctl --version &>/dev/null 2>&1
 }
 
 #================================================================
@@ -77,20 +97,29 @@ stage_get_info() {
     echo ""
 
     log_info "正在获取公网IPv4地址..."
-    PUBLIC_IP=$(curl -4 -s --max-time 10 ip.sb 2>/dev/null)
+
+    # 按优先级尝试多个来源
+    local ip_sources=(
+        "ip.sb"
+        "ifconfig.me"
+        "icanhazip.com"
+        "checkip.amazonaws.com"
+    )
+
+    for src in "${ip_sources[@]}"; do
+        PUBLIC_IP=$(curl -4 -s --max-time 10 --connect-timeout 5 "$src" 2>/dev/null | tr -d ' \n\r')
+        if is_valid_ipv4 "$PUBLIC_IP"; then
+            log_ok "公网IPv4: ${GREEN}${PUBLIC_IP}${NC} (来源: ${src})"
+            break
+        fi
+        PUBLIC_IP=""
+    done
+
     if [[ -z "$PUBLIC_IP" ]]; then
-        log_warn "ip.sb 失败，尝试 ifconfig.me..."
-        PUBLIC_IP=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null)
-    fi
-    if [[ -z "$PUBLIC_IP" ]]; then
-        log_warn "ifconfig.me 失败，尝试 ipinfo.io..."
-        PUBLIC_IP=$(curl -4 -s --max-time 10 https://ipinfo.io/ip 2>/dev/null)
-    fi
-    if [[ -z "$PUBLIC_IP" ]]; then
-        log_error "所有方法均无法获取公网IP，脚本退出"
+        log_error "所有方法均无法获取有效公网IPv4，脚本退出"
+        log_info "提示：若机器为 IPv6-only 环境，脚本暂不支持"
         exit 1
     fi
-    log_ok "公网IPv4: ${GREEN}${PUBLIC_IP}${NC}"
 
     log_info "正在查询IP归属信息 (ipinfo.io/${PUBLIC_IP})..."
     local raw_json=""
@@ -101,6 +130,7 @@ stage_get_info() {
         exit 1
     fi
 
+    # 优先用 jq，jq 不存在则先尝试安装
     if command -v jq &>/dev/null; then
         DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty')
         COUNTRY=$(echo "$raw_json" | jq -r '.country // empty')
@@ -108,11 +138,20 @@ stage_get_info() {
         REGION=$(echo "$raw_json" | jq -r '.region // empty')
         ORG=$(echo "$raw_json" | jq -r '.org // empty')
     else
-        DETECTED_TZ=$(echo "$raw_json" | grep -oP '"timezone"\s*:\s*"\K[^"]+' 2>/dev/null)
-        COUNTRY=$(echo "$raw_json" | grep -oP '"country"\s*:\s*"\K[^"]+' 2>/dev/null)
-        CITY=$(echo "$raw_json" | grep -oP '"city"\s*:\s*"\K[^"]+' 2>/dev/null)
-        REGION=$(echo "$raw_json" | grep -oP '"region"\s*:\s*"\K[^"]+' 2>/dev/null)
-        ORG=$(echo "$raw_json" | grep -oP '"org"\s*:\s*"\K[^"]+' 2>/dev/null)
+        if install_package jq 2>/dev/null && command -v jq &>/dev/null; then
+            DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty')
+            COUNTRY=$(echo "$raw_json" | jq -r '.country // empty')
+            CITY=$(echo "$raw_json" | jq -r '.city // empty')
+            REGION=$(echo "$raw_json" | jq -r '.region // empty')
+            ORG=$(echo "$raw_json" | jq -r '.org // empty')
+        else
+            # 严格兜底，grep 解析 JSON（兼容 macOS BSD grep）
+            DETECTED_TZ=$(echo "$raw_json" | grep -oP '"timezone"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+            COUNTRY=$(echo "$raw_json" | grep -oP '"country"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+            CITY=$(echo "$raw_json" | grep -oP '"city"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+            REGION=$(echo "$raw_json" | grep -oP '"region"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+            ORG=$(echo "$raw_json" | grep -oP '"org"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+        fi
     fi
 
     if [[ -z "$DETECTED_TZ" ]]; then
@@ -172,7 +211,10 @@ stage_set_timezone() {
     fi
 
     rm -f /etc/localtime 2>/dev/null
-    ln -s "/usr/share/zoneinfo/${tz}" /etc/localtime
+    ln -s "/usr/share/zoneinfo/${tz}" /etc/localtime || {
+        log_error "无法创建 /etc/localtime 链接（可能为只读文件系统）"
+        exit 1
+    }
     echo "$tz" > /etc/timezone 2>/dev/null || true
 
     local verify_tz=""
@@ -180,9 +222,54 @@ stage_set_timezone() {
     if [[ "$verify_tz" == "$tz" ]]; then
         log_ok "链接方式设置成功: ${GREEN}${tz}${NC}"
     else
-        log_error "时区设置失败"
+        log_error "时区设置验证失败"
+        exit 1
     fi
     echo ""
+}
+
+#================================================================
+# 停止冲突的时间同步服务
+#================================================================
+stop_conflicting_services() {
+    if ! has_systemd; then
+        log_info "非 systemd 环境，跳过服务停止步骤"
+        return 0
+    fi
+
+    if systemctl is-active systemd-timesyncd &>/dev/null; then
+        log_info "停止 systemd-timesyncd 避免冲突..."
+        systemctl stop systemd-timesyncd 2>/dev/null || true
+        systemctl disable systemd-timesyncd 2>/dev/null || true
+        systemctl mask systemd-timesyncd 2>/dev/null || true
+        log_ok "systemd-timesyncd 已停止并禁用"
+    fi
+
+    if systemctl is-active ntpd &>/dev/null 2>&1; then
+        log_info "停止 ntpd..."
+        systemctl stop ntpd 2>/dev/null || true
+        systemctl disable ntpd 2>/dev/null || true
+    fi
+
+    if systemctl is-active chronyd &>/dev/null 2>&1; then
+        systemctl stop chronyd 2>/dev/null || true
+    fi
+}
+
+#================================================================
+# 获取 chrony 配置路径（修复目录不存在时的 bug）
+#================================================================
+get_chrony_conf_path() {
+    if [[ -f /etc/chrony/chrony.conf ]]; then
+        echo "/etc/chrony/chrony.conf"
+    elif [[ -f /etc/chrony.conf ]]; then
+        echo "/etc/chrony.conf"
+    elif [[ -d /etc/chrony ]]; then
+        echo "/etc/chrony/chrony.conf"
+    else
+        mkdir -p /etc/chrony 2>/dev/null || true
+        echo "/etc/chrony/chrony.conf"
+    fi
 }
 
 #================================================================
@@ -196,114 +283,51 @@ stage_sync_time() {
 
     local tz="$DETECTED_TZ"
 
-    # ---- 选择NTP服务器 ----
     log_info "根据时区选择最优NTP服务器..."
 
-    local ntp_primary=""
-    local ntp_secondary=""
-    local ntp_tertiary=""
+    local ntp_primary="" ntp_secondary="" ntp_tertiary=""
 
     case "$tz" in
         Asia/Shanghai|Asia/Chongqing|Asia/Harbin|Asia/Urumqi)
-            ntp_primary="cn.pool.ntp.org"
-            ntp_secondary="ntp.aliyun.com"
-            ntp_tertiary="ntp.tencent.com"
-            ;;
+            ntp_primary="ntp.aliyun.com"; ntp_secondary="ntp.tencent.com"; ntp_tertiary="cn.pool.ntp.org" ;;
         Asia/Hong_Kong)
-            ntp_primary="hk.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="hk.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Asia/Tokyo)
-            ntp_primary="jp.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="jp.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Asia/Seoul)
-            ntp_primary="kr.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="kr.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Asia/Singapore)
-            ntp_primary="sg.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="sg.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Asia/Taipei)
-            ntp_primary="tw.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
-        Asia/Kolkata|Asia/Calcutta)
-            ntp_primary="in.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="tw.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
+        Asia/Kolkata)
+            ntp_primary="in.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Asia/Bangkok|Asia/Ho_Chi_Minh|Asia/Jakarta|Asia/Manila)
-            ntp_primary="asia.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="asia.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Asia/*)
-            ntp_primary="asia.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="asia.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Europe/London)
-            ntp_primary="uk.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
-        Europe/Berlin|Europe/Paris|Europe/Amsterdam)
-            ntp_primary="de.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="uk.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
+        Europe/Berlin|Europe/Paris|Europe/Amsterdam|Europe/Madrid|Europe/Rome)
+            ntp_primary="de.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Europe/Moscow)
-            ntp_primary="ru.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="ru.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Europe/*)
-            ntp_primary="europe.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
-        America/New_York|America/Chicago|America/Denver|America/Los_Angeles)
-            ntp_primary="us.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="europe.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
+        America/New_York|America/Chicago|America/Denver|America/Los_Angeles|America/Phoenix)
+            ntp_primary="us.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         America/Toronto|America/Vancouver)
-            ntp_primary="ca.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="ca.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         America/Sao_Paulo)
-            ntp_primary="br.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="br.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         America/*)
-            ntp_primary="north-america.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
-        Australia/*|Pacific/*)
-            ntp_primary="oceania.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="north-america.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
+        Australia/*|Pacific/Auckland)
+            ntp_primary="oceania.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         Africa/*)
-            ntp_primary="africa.pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="africa.pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
         *)
-            ntp_primary="pool.ntp.org"
-            ntp_secondary="time.google.com"
-            ntp_tertiary="time.cloudflare.com"
-            ;;
+            ntp_primary="pool.ntp.org"; ntp_secondary="time.google.com"; ntp_tertiary="time.cloudflare.com" ;;
     esac
 
     log_ok "主NTP: ${GREEN}${ntp_primary}${NC}"
@@ -311,9 +335,8 @@ stage_sync_time() {
     log_ok "三NTP: ${GREEN}${ntp_tertiary}${NC}"
     echo ""
 
-    # ---- 检测同步工具，没有就自动安装 ----
+    # ---- 检测 / 安装同步工具 ----
     local sync_tool=""
-
     if command -v chronyd &>/dev/null; then
         sync_tool="chrony"
     elif command -v ntpdate &>/dev/null; then
@@ -321,23 +344,17 @@ stage_sync_time() {
     elif command -v ntpd &>/dev/null; then
         sync_tool="ntpd"
     else
-        log_warn "未检测到NTP工具，正在自动安装 chrony..."
+        log_warn "未检测到NTP工具，正在自动安装..."
         echo ""
         if install_package "chrony"; then
             sync_tool="chrony"
+        elif install_package "ntpdate"; then
+            sync_tool="ntpdate"
+        elif install_package "ntp"; then
+            sync_tool="ntpd"
         else
-            log_warn "chrony 安装失败，尝试安装 ntpdate..."
-            if install_package "ntpdate"; then
-                sync_tool="ntpdate"
-            else
-                log_warn "ntpdate 安装失败，尝试安装 ntp..."
-                if install_package "ntp"; then
-                    sync_tool="ntpd"
-                else
-                    sync_tool="http"
-                    log_warn "所有NTP工具安装失败，将使用HTTP方式同步"
-                fi
-            fi
+            sync_tool="http"
+            log_warn "所有NTP工具安装失败，将使用HTTP方式同步"
         fi
         echo ""
     fi
@@ -355,166 +372,132 @@ stage_sync_time() {
     case "$sync_tool" in
         chrony)
             log_info "配置 Chrony..."
+            stop_conflicting_services
 
-            # ---- 停掉 systemd-timesyncd 避免冲突 ----
-            if systemctl is-active systemd-timesyncd &>/dev/null; then
-                log_info "停止 systemd-timesyncd 避免冲突..."
-                systemctl stop systemd-timesyncd 2>/dev/null || true
-                systemctl disable systemd-timesyncd 2>/dev/null || true
-                systemctl mask systemd-timesyncd 2>/dev/null || true
-                log_ok "systemd-timesyncd 已停止"
-            fi
+            local chrony_conf
+            chrony_conf=$(get_chrony_conf_path)
 
-            local chrony_conf="/etc/chrony/chrony.conf"
-            if [[ ! -d "/etc/chrony" ]]; then
-                if [[ -f "/etc/chrony.conf" ]]; then
-                    chrony_conf="/etc/chrony.conf"
-                else
-                    mkdir -p /etc/chrony 2>/dev/null
-                fi
-            fi
+            [[ -f "$chrony_conf" ]] && cp "$chrony_conf" "${chrony_conf}.bak" 2>/dev/null || true
 
-            if [[ -f "$chrony_conf" ]]; then
-                cp "$chrony_conf" "${chrony_conf}.bak" 2>/dev/null || true
-            fi
+            cat > "$chrony_conf" <<EOF
+# Auto-generated by tz-chronyd
+server ${ntp_primary} iburst
+server ${ntp_secondary} iburst
+server ${ntp_tertiary} iburst
 
-            {
-                echo "# Auto-generated by vps-time-sync"
-                echo "server ${ntp_primary} iburst"
-                echo "server ${ntp_secondary} iburst"
-                echo "server ${ntp_tertiary} iburst"
-                echo ""
-                echo "driftfile /var/lib/chrony/chrony.drift"
-                echo "makestep 1.0 3"
-                echo "rtcsync"
-            } > "$chrony_conf"
-
+driftfile /var/lib/chrony/chrony.drift
+makestep 1.0 3
+rtcsync
+EOF
             log_ok "配置已写入: ${chrony_conf}"
 
-            systemctl stop chronyd 2>/dev/null || true
-            sleep 1
-            systemctl enable chronyd 2>/dev/null || true
-            systemctl start chronyd 2>/dev/null || true
+            if has_systemd; then
+                systemctl enable chronyd 2>/dev/null || true
+                systemctl start chronyd 2>/dev/null || true
+            fi
 
-            # ---- 让 timedatectl 识别 NTP 服务 ----
             timedatectl set-ntp true 2>/dev/null || true
 
-            log_info "等待 Chrony 同步（5秒）..."
-            sleep 5
+            log_info "等待 Chrony 同步（6秒）..."
+            sleep 6
 
             if chronyc -a makestep >/dev/null 2>&1; then
                 sync_ok=true
                 log_ok "Chrony makestep 执行成功"
             else
-                log_warn "chronyc makestep 返回异常，检查状态..."
+                log_warn "chronyc makestep 返回异常"
             fi
-
-            sleep 2
 
             echo ""
             log_info "Chrony 同步源:"
             echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
-            chronyc sources 2>/dev/null | while IFS= read -r line; do
-                echo -e "  $line"
-            done
+            chronyc sources 2>/dev/null | sed 's/^/  /'
             echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
 
             echo ""
             log_info "Chrony tracking:"
             echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
-            chronyc tracking 2>/dev/null | while IFS= read -r line; do
-                echo -e "  $line"
-            done
+            chronyc tracking 2>/dev/null | sed 's/^/  /'
             echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
             ;;
 
         ntpdate)
             log_info "使用 ntpdate 单次同步..."
-
-            # ---- 停掉冲突服务 ----
-            systemctl stop systemd-timesyncd 2>/dev/null || true
-            systemctl disable systemd-timesyncd 2>/dev/null || true
+            stop_conflicting_services
 
             for srv in "$ntp_primary" "$ntp_secondary" "$ntp_tertiary"; do
                 log_info "尝试 ${srv}..."
-                local ntpdate_output=""
-                ntpdate_output=$(ntpdate -b "$srv" 2>&1)
-                if [[ $? -eq 0 ]]; then
+                local output
+                if output=$(ntpdate -b "$srv" 2>&1); then
                     sync_ok=true
                     log_ok "ntpdate 同步成功 (${srv})"
-                    echo -e "         ${ntpdate_output}"
+                    echo "         ${output}"
                     break
                 else
-                    log_warn "${srv} 失败: ${ntpdate_output}"
+                    log_warn "${srv} 失败: ${output}"
                 fi
             done
             ;;
 
         ntpd)
             log_info "配置 NTPD..."
+            stop_conflicting_services
 
-            # ---- 停掉冲突服务 ----
-            systemctl stop systemd-timesyncd 2>/dev/null || true
-            systemctl disable systemd-timesyncd 2>/dev/null || true
-            systemctl stop ntpd 2>/dev/null || true
+            [[ -f /etc/ntp.conf ]] && cp /etc/ntp.conf /etc/ntp.conf.bak 2>/dev/null || true
 
-            if [[ -f /etc/ntp.conf ]]; then
-                cp /etc/ntp.conf /etc/ntp.conf.bak 2>/dev/null || true
-            fi
+            cat > /etc/ntp.conf <<EOF
+# Auto-generated by tz-chronyd
+driftfile /var/lib/ntp/drift
+restrict default kod nomodify notrap nopeer noquery
+restrict 127.0.0.1
 
-            {
-                echo "# Auto-generated by vps-time-sync"
-                echo "driftfile /var/lib/ntp/drift"
-                echo "restrict default kod nomodify notrap nopeer noquery"
-                echo "restrict 127.0.0.1"
-                echo ""
-                echo "server ${ntp_primary} iburst prefer"
-                echo "server ${ntp_secondary} iburst"
-                echo "server ${ntp_tertiary} iburst"
-            } > /etc/ntp.conf
-
+server ${ntp_primary} iburst prefer
+server ${ntp_secondary} iburst
+server ${ntp_tertiary} iburst
+EOF
             log_ok "配置已写入: /etc/ntp.conf"
-            systemctl enable ntpd 2>/dev/null || true
-            systemctl start ntpd 2>/dev/null || true
-            log_info "等待 NTPD 同步（5秒）..."
-            sleep 5
+
+            if has_systemd; then
+                systemctl enable ntpd 2>/dev/null || true
+                systemctl start ntpd 2>/dev/null || true
+            fi
+            log_info "等待 NTPD 同步（6秒）..."
+            sleep 6
             sync_ok=true
 
             echo ""
             log_info "NTP peers:"
             echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
-            ntpq -p 2>/dev/null | while IFS= read -r line; do
-                echo -e "  $line"
-            done
+            ntpq -p 2>/dev/null | sed 's/^/  /'
             echo -e "  ${CYAN}-----------------------------------------------------------${NC}"
             ;;
 
         http)
             log_warn "使用HTTP方式获取时间（精度较低）..."
             for url in "https://www.google.com" "https://www.cloudflare.com" "https://www.baidu.com"; do
-                local http_date=""
-                http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
+                local http_date
+                http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | \
+                    grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
                 if [[ -n "$http_date" ]]; then
                     log_info "获取到HTTP时间: ${http_date}"
                     if date -s "$http_date" >/dev/null 2>&1; then
                         sync_ok=true
                         log_ok "HTTP时间同步成功 (${url})"
                         break
-                    else
-                        log_warn "date -s 设置失败"
                     fi
                 fi
             done
             ;;
     esac
 
-    # ---- HTTP兜底 ----
+    # ---- HTTP 兜底 ----
     if [[ "$sync_ok" != "true" ]] && [[ "$sync_tool" != "http" ]]; then
         echo ""
         log_warn "NTP同步未成功，尝试HTTP方式兜底..."
         for url in "https://www.google.com" "https://www.cloudflare.com" "https://www.baidu.com"; do
-            local http_date=""
-            http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
+            local http_date
+            http_date=$(curl -sI --max-time 5 "$url" 2>/dev/null | \
+                grep -i "^date:" | head -1 | sed 's/^[Dd]ate: //i' | tr -d '\r')
             if [[ -n "$http_date" ]]; then
                 log_info "HTTP时间: ${http_date}"
                 if date -s "$http_date" >/dev/null 2>&1; then
@@ -585,9 +568,7 @@ stage_show_result() {
     if command -v timedatectl &>/dev/null; then
         echo ""
         echo -e "  ${YELLOW}[timedatectl 状态]${NC}"
-        timedatectl status 2>/dev/null | while IFS= read -r line; do
-            echo -e "     ${line}"
-        done
+        timedatectl status 2>/dev/null | sed 's/^/     /'
     fi
 
     echo ""
