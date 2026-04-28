@@ -47,6 +47,8 @@ separator() {
 #================================================================
 install_package() {
     local pkg="$1"
+    # 部分软件包名与二进制文件名不同（如 chrony→chronyd, ntp→ntpd）
+    local binary="${2:-$1}"
     log_info "正在安装 ${pkg}..."
 
     local ret=0
@@ -67,7 +69,7 @@ install_package() {
         return 1
     fi
 
-    if [[ $ret -eq 0 ]] && command -v "$pkg" &>/dev/null; then
+    if [[ $ret -eq 0 ]] && command -v "$binary" &>/dev/null; then
         log_ok "${pkg} 安装成功"
         return 0
     else
@@ -359,11 +361,11 @@ stage_sync_time() {
     else
         log_warn "未检测到NTP工具，正在自动安装..."
         echo ""
-        if install_package "chrony"; then
+        if install_package "chrony" "chronyd"; then
             sync_tool="chrony"
         elif install_package "ntpdate"; then
             sync_tool="ntpdate"
-        elif install_package "ntp"; then
+        elif install_package "ntp" "ntpd"; then
             sync_tool="ntpd"
         else
             sync_tool="http"
