@@ -99,6 +99,12 @@ hwclock --show
 
 ## 📜 更新日志
 
+### [1.2.0] — 2026-04-28
+
+- 🐛 **修复**: `install_package` 安装成功检测逻辑错误——用包名 `chrony` 检查二进制是否存在，但实际二进制名为 `chronyd`，导致 chrony 安装成功却误报失败、跳过后续安装流程，需第二次运行才能工作（`ntp` 包同理）
+- 🐛 **修复**: ipinfo.io 使用自定义 UA 头导致返回 HTML 而非 JSON，jq 解析时报 `parse error: Invalid numeric literal`
+- 🧹 **优化**: jq 命令静默处理非 JSON 输入，失败时自动降级到 sed 兜底
+
 ### [1.1.0] — 2026-04-28
 
 - 🐛 **修复**: 中国 VPS 上 HTTP 兜底因 `set -euo pipefail` 导致脚本意外退出
