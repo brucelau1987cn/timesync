@@ -130,7 +130,7 @@ stage_get_info() {
 
     log_info "正在查询IP归属信息 (ipinfo.io/${PUBLIC_IP})..."
     local raw_json=""
-    raw_json=$(curl -fsSL --user-agent "timesync/1.0" --max-time 15 "https://ipinfo.io/${PUBLIC_IP}" 2>/dev/null)
+    raw_json=$(curl -s --max-time 15 "https://ipinfo.io/${PUBLIC_IP}" 2>/dev/null)
 
     if [[ -z "$raw_json" ]]; then
         log_error "无法从 ipinfo.io 获取信息，脚本退出"
@@ -139,18 +139,18 @@ stage_get_info() {
 
     # 优先用 jq，jq 不存在则先尝试安装
     if command -v jq &>/dev/null; then
-        DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty')
-        COUNTRY=$(echo "$raw_json" | jq -r '.country // empty')
-        CITY=$(echo "$raw_json" | jq -r '.city // empty')
-        REGION=$(echo "$raw_json" | jq -r '.region // empty')
-        ORG=$(echo "$raw_json" | jq -r '.org // empty')
+        DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty' 2>/dev/null || echo "")
+        COUNTRY=$(echo "$raw_json" | jq -r '.country // empty' 2>/dev/null || echo "")
+        CITY=$(echo "$raw_json" | jq -r '.city // empty' 2>/dev/null || echo "")
+        REGION=$(echo "$raw_json" | jq -r '.region // empty' 2>/dev/null || echo "")
+        ORG=$(echo "$raw_json" | jq -r '.org // empty' 2>/dev/null || echo "")
     else
         if install_package jq 2>/dev/null && command -v jq &>/dev/null; then
-            DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty')
-            COUNTRY=$(echo "$raw_json" | jq -r '.country // empty')
-            CITY=$(echo "$raw_json" | jq -r '.city // empty')
-            REGION=$(echo "$raw_json" | jq -r '.region // empty')
-            ORG=$(echo "$raw_json" | jq -r '.org // empty')
+            DETECTED_TZ=$(echo "$raw_json" | jq -r '.timezone // empty' 2>/dev/null || echo "")
+            COUNTRY=$(echo "$raw_json" | jq -r '.country // empty' 2>/dev/null || echo "")
+            CITY=$(echo "$raw_json" | jq -r '.city // empty' 2>/dev/null || echo "")
+            REGION=$(echo "$raw_json" | jq -r '.region // empty' 2>/dev/null || echo "")
+            ORG=$(echo "$raw_json" | jq -r '.org // empty' 2>/dev/null || echo "")
         else
             # 严格兜底，sed 解析 JSON（兼容所有平台，包括 Alpine BusyBox）
             DETECTED_TZ=$(echo "$raw_json" | sed -n 's/.*"timezone"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' 2>/dev/null || echo "")
