@@ -1,39 +1,53 @@
-# ⏰ VPS 时区 & 时间自动设置校准脚本
+# ⏰ VPS 时区 & 时间自动校准脚本
 
-自动根据 VPS 公网IP地址识别所属时区，配置系统时区并通过NTP同步时间，全程无需手动操作。
+自动根据 VPS 公网 IP 地址识别所属时区，配置系统时区并通过 NTP 同步时间，全程无需手动操作。
+
+## ✨ 特性
+
+- 🌐 **智能 IP 归属检测** — 优先从 ipinfo.io 获取时区，多来源自动兜底
+- 🕐 **时区全覆盖** — 支持亚洲、欧洲、北美、南美、大洋洲、非洲主要时区
+- 🛡️ **冲突自动处理** — 自动停止 systemd-timesyncd / ntpd 等冲突服务
+- 🔧 **多工具支持** — chrony / ntpdate / ntpd 全自动检测安装
+- 🌐 **HTTP 兜底** — NTP 不通时自动尝试 HTTP Date 头同步
+- 📦 **多发行版支持** — Debian/Ubuntu、CentOS/RHEL、Alpine、Arch
 
 ## 🔄 工作流程
-### 阶段一：获取公网IP和时区
-  curl -4 ip.sb → 获取公网IPv4
-  curl ipinfo.io/{IP} → 获取时区/地区/运营商
 
-### 阶段二：设置系统时区
-  timedatectl set-timezone 或 ln -s 链接方式
-  
-### 阶段三：NTP时间同步
-  自动检测/安装同步工具 → 选择就近NTP服务器同步
-  
-### 阶段四：输出结果汇总
-  IP信息 / 时区信息 / 同步前后时间对比
-
-## 🔧 NTP工具处理逻辑
 ```
-检测系统已安装的NTP工具
-├── 有 chronyd   → 直接使用
-├── 有 ntpdate   → 直接使用
-├── 有 ntpd      → 直接使用
+阶段一：获取公网IP和时区
+  └─ 多个 IP 来源自动兜底 + 格式校验
+
+阶段二：设置系统时区
+  └─ timedatectl 优先，ln -s 链接兜底，事后验证
+
+阶段三：NTP时间同步
+  └─ 自动检测/安装 chrony → 就近 NTP 服务器同步
+
+阶段四：输出结果汇总
+  └─ IP信息 / 时区信息 / 同步前后时间对比
+```
+
+## 🔧 NTP 工具处理逻辑
+
+```
+检测系统已安装的 NTP 工具
+├── 有 chronyd  → 直接使用（推荐）
+├── 有 ntpdate  → 单次同步
+├── 有 ntpd     → 配置并启动
 └── 都没有 → 自动安装
-    ├── 安装 chrony    → 成功则使用
-    ├── 安装 ntpdate   → 成功则使用
-    ├── 安装 ntp       → 成功则使用
-    └── 全部失败 → HTTP方式兜底
+    ├── 安装 chrony   → 成功则使用
+    ├── 安装 ntpdate  → 成功则使用
+    ├── 安装 ntp      → 成功则使用
+    └── 全部失败 → HTTP Date 头兜底同步
 ```
 
 ## 🚀 一键运行
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-chronyd/main/tz-chronyd.sh)
+curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-chronyd/main/tz-chronyd.sh | bash
 ```
+
+> 需要 root 权限运行
 
 ## 🛠️ 后续常用命令
 
@@ -41,12 +55,35 @@ bash <(curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/tz-chronyd/ma
 # 查看当前时间和时区状态
 timedatectl
 
-# 查看Chrony同步精度
+# 查看 Chrony 同步精度
 chronyc tracking
 
-# 查看NTP服务器连接状态
+# 查看 NTP 服务器连接状态
 chronyc sources -v
 
-# 手动强制同步一次
+# 手动强制同步一次（立即生效）
 chronyc makestep
+
+# 查看硬件时钟
+hwclock --show
 ```
+
+## 📋 支持的时区（部分）
+
+| 地区 | 时区 | 优先 NTP 服务器 |
+|------|------|-----------------|
+| 🇨🇳 中国大陆 | Asia/Shanghai | ntp.aliyun.com / ntp.tencent.com |
+| 🇭🇰 香港 | Asia/Hong_Kong | hk.pool.ntp.org |
+| 🇯🇵 日本 | Asia/Tokyo | jp.pool.ntp.org |
+| 🇰🇷 韩国 | Asia/Seoul | kr.pool.ntp.org |
+| 🇸🇬 新加坡 | Asia/Singapore | sg.pool.ntp.org |
+| 🇹🇼 台湾 | Asia/Taipei | tw.pool.ntp.org |
+| 🇬🇧 英国 | Europe/London | uk.pool.ntp.org |
+| 🇩🇪 德国/法国 | Europe/Berlin | de.pool.ntp.org |
+| 🇺🇸 美国 | America/New_York 等 | us.pool.ntp.org |
+| 🌐 其他 | - | pool.ntp.org + Google/Cloudflare |
+
+## 🐛 已知问题
+
+- IPv6-only 环境暂不支持
+- 非 root 用户需配合 `sudo` 使用
