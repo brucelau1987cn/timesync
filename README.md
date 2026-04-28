@@ -3,6 +3,7 @@
 自动根据 VPS 公网 IP 地址识别所属时区，配置系统时区并通过 NTP 同步时间，全程无需手动操作。
 
 [![ShellCheck](https://img.shields.io/badge/ShellCheck-passing-brightgreen)](https://github.com/koalaman/shellcheck)
+[![Release](https://img.shields.io/github/v/release/brucelau1987cn/timesync?color=blue&label=version)](https://github.com/brucelau1987cn/timesync/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## ✨ 特性
