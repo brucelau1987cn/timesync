@@ -409,9 +409,45 @@ rtcsync
 EOF
             log_ok "配置已写入: ${chrony_conf}"
 
+            # Ensure necessary directories exist for chrony
+            mkdir -p /var/lib/chrony /var/run/chrony 2>/dev/null || true
             if has_systemd; then
-                systemctl enable chronyd 2>/dev/null || true
-                systemctl start chronyd 2>/dev/null || true
+                # Try common service unit names: chronyd (binary) or chrony (unit)
+                local _svc="chronyd"
+                if systemctl enable chronyd >/dev/null 2>&1; then
+                    _svc=chronyd
+                elif systemctl enable chrony >/dev/null 2>&1; then
+                    _svc=chrony
+                fi
+                systemctl start "${_svc}" 2>/dev/null || true
+
+                # Give it a moment to come up
+                sleep 1
+
+                # If the selected unit isn't active, try the other common name
+                if ! systemctl is-active --quiet "${_svc}"; then
+                    if [[ "${_svc}" == "chronyd" ]]; then
+                        systemctl start chrony 2>/dev/null || true
+                        _svc=chrony
+                    else
+                        systemctl start chronyd 2>/dev/null || true
+                        _svc=chronyd
+                    fi
+                fi
+
+                # If chrony still isn't active, capture logs when possible to help debugging
+                if ! systemctl is-active --quiet "${_svc}"; then
+                    if command -v journalctl &>/dev/null; then
+                        log_warn "chrony 服务未能成功启动，最近日志：\n$(journalctl -u ${_svc} -n 50 --no-pager 2>/dev/null | sed 's/^/  /')"
+                    else
+                        log_warn "chrony 服务未能成功启动，无法读取 journalctl 日志。请手动检查服务状态。"
+                    fi
+                fi
+            else
+                # Non-systemd environments: attempt to start chronyd directly
+                if command -v chronyd &>/dev/null; then
+                    chronyd 2>/dev/null &
+                fi
             fi
 
             timedatectl set-ntp false 2>/dev/null || true
