@@ -281,6 +281,9 @@ stop_conflicting_services() {
         return 0
     fi
 
+    # 先关闭 systemd 的 NTP 管理，防止它在后续步骤中干预 chrony 的启停
+    timedatectl set-ntp false 2>/dev/null || true
+
     if systemctl is-active systemd-timesyncd &>/dev/null; then
         log_info "停止 systemd-timesyncd 避免冲突..."
         systemctl stop systemd-timesyncd 2>/dev/null || true
@@ -535,8 +538,6 @@ EOF
                     chronyd 2>/dev/null &
                 fi
             fi
-
-            timedatectl set-ntp false 2>/dev/null || true
 
             log_info "等待 Chrony 同步（6秒）..."
             sleep 6
