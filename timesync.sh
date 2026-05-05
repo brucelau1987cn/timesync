@@ -666,7 +666,10 @@ stage_show_result() {
 # 主函数
 #================================================================
 main() {
-    clear
+    # Only clear when running in an interactive terminal
+    if [[ -t 1 ]] && [[ -n "${TERM:-}" ]]; then
+        clear || true
+    fi
     echo ""
     separator
     echo -e "${CYAN}          VPS 时区和时间自动校准脚本${NC}"
