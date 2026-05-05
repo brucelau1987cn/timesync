@@ -15,6 +15,7 @@
 - 🌐 **HTTP 兜底** — NTP 不通时自动尝试 HTTP Date 头同步
 - 📦 **多发行版支持** — Debian/Ubuntu、CentOS/RHEL、Alpine、Arch
 - 🐚 **ShellCheck 零警告** — 通过严格静态检查，兼容 POSIX sed
+- 🤖 **非交互安全** — 支持 `curl | bash`、SSH/CI/cron 等无 TTY 环境运行，避免终端命令导致脚本提前退出
 
 ## 🔄 工作流程
 
@@ -53,6 +54,18 @@ curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesy
 ```
 
 > 需要 root 权限运行
+
+### 🤖 非交互环境运行
+
+脚本已兼容无 TTY/无 `TERM` 的非交互环境，例如 SSH 远程命令、CI、cron、自动化面板等。终端专用命令会自动跳过，不会因为 `TERM environment variable not set` 导致 `set -euo pipefail` 提前退出。
+
+```bash
+# 远程/自动化环境推荐写法
+curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh | bash
+
+# 如果你的运行器强制要求 TERM，也可以显式设置
+TERM=xterm bash timesync.sh
+```
 
 ## 🛠️ 后续常用命令
 
@@ -113,6 +126,8 @@ hwclock --show
   - 若系统存在 `_chrony` 用户，将这些目录的归属设置为 `_chrony:_chrony` 并应用合适权限；删除可能存在的陈旧 PID `/run/chrony/chronyd.pid`。
   - 启动/重启 chrony 后等待最多 10s 以确保 systemd 单元稳定运行，并在调用 `chronyc -a makestep` 之前等待 chronyc 响应（最多重试 5 次）。
   - 当 chrony 无法启动时扩展 journal 日志输出以方便排查。
+- 🛡️ **加固**: 非交互环境运行时自动跳过 `clear` 等终端专用操作，避免因无 `TERM` 导致脚本提前退出。
+- 📚 **文档**: 新增非交互运行说明，覆盖 SSH/CI/cron/自动化面板等场景。
 
 ### [1.1.0] — 2026-04-28
 
