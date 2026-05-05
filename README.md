@@ -106,6 +106,14 @@ hwclock --show
 - 🐛 **修复**: ipinfo.io 使用自定义 UA 头导致返回 HTML 而非 JSON，jq 解析时报 `parse error: Invalid numeric literal`
 - 🧹 **优化**: jq 命令静默处理非 JSON 输入，失败时自动降级到 sed 兜底
 
+### [1.2.3] — 2026-05-05
+
+- 🐛 **修复 (Debian 13)**: 解决 chrony 在 Debian 13(trixie) 上启动后立即退出，导致 `chronyc makestep` 报错 `506 Cannot talk to daemon` 的问题。
+  - 在启动 chrony 之前确保 runtime/state/log 目录存在：`/var/run/chrony`、`/var/lib/chrony`、`/var/log/chrony`。
+  - 若系统存在 `_chrony` 用户，将这些目录的归属设置为 `_chrony:_chrony` 并应用合适权限；删除可能存在的陈旧 PID `/run/chrony/chronyd.pid`。
+  - 启动/重启 chrony 后等待最多 10s 以确保 systemd 单元稳定运行，并在调用 `chronyc -a makestep` 之前等待 chronyc 响应（最多重试 5 次）。
+  - 当 chrony 无法启动时扩展 journal 日志输出以方便排查。
+
 ### [1.1.0] — 2026-04-28
 
 - 🐛 **修复**: 中国 VPS 上 HTTP 兜底因 `set -euo pipefail` 导致脚本意外退出
