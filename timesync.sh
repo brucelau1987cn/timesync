@@ -295,9 +295,25 @@ stop_conflicting_services() {
         systemctl disable ntpd 2>/dev/null || true
     fi
 
-    if systemctl is-active chronyd &>/dev/null 2>&1; then
-        systemctl stop chronyd 2>/dev/null || true
+    # 停止所有可能的 chrony 服务单元名（chrony 和 chronyd 二选一或两者都有）
+    for _u in chrony chronyd; do
+        if systemctl is-active "$_u" &>/dev/null 2>&1 || systemctl is-enabled "$_u" &>/dev/null 2>&1; then
+            log_info "停止 ${_u}..."
+            systemctl stop "$_u" 2>/dev/null || true
+        fi
+    done
+
+    # 强制结束所有残留 chronyd 进程
+    if pgrep -x chronyd &>/dev/null; then
+        log_info "清理残留 chronyd 进程..."
+        pkill -x chronyd 2>/dev/null || true
+        sleep 1
     fi
+
+    # 清理旧的 PID / socket 文件，防止二次运行时 daemon 启动失败
+    rm -f /run/chrony/chronyd.pid /var/run/chrony/chronyd.pid \
+          /run/chronyd.pid /var/run/chronyd.pid \
+          /run/chrony/chronyd.sock /var/run/chrony/chronyd.sock 2>/dev/null || true
 }
 
 #================================================================
@@ -439,39 +455,62 @@ EOF
             log_ok "配置已写入: ${chrony_conf}"
 
             # Ensure necessary directories exist for chrony
-            mkdir -p /var/lib/chrony /var/run/chrony 2>/dev/null || true
-            # Ensure runtime dir has correct ownership for _chrony user when present
-            if id -u _chrony &>/dev/null; then
-                chown _chrony:_chrony /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
+            mkdir -p /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
+
+            # Determine the chrony user (Debian/Ubuntu use 'chrony', others use '_chrony')
+            local _chrony_user=""
+            for _cu in _chrony chrony; do
+                if id -u "$_cu" &>/dev/null; then
+                    _chrony_user="$_cu"
+                    break
+                fi
+            done
+
+            if [[ -n "$_chrony_user" ]]; then
+                chown "${_chrony_user}:${_chrony_user}" /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
                 chmod 0750 /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
-                # remove stale pid file
-                rm -f /run/chrony/chronyd.pid 2>/dev/null || true
             else
-                # fallback permissive mode
                 chmod 0755 /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
             fi
 
+            # Always remove stale PID / socket files before starting (covers all user cases)
+            rm -f /run/chrony/chronyd.pid /var/run/chrony/chronyd.pid \
+                  /run/chronyd.pid /var/run/chronyd.pid \
+                  /run/chrony/chronyd.sock /var/run/chrony/chronyd.sock 2>/dev/null || true
+
             if has_systemd; then
-                # Try common service unit names: chronyd (binary) or chrony (unit)
-                local _svc="chronyd"
-                if systemctl enable chronyd >/dev/null 2>&1; then
-                    _svc=chronyd
-                elif systemctl enable chrony >/dev/null 2>&1; then
-                    _svc=chrony
+                # Detect which unit name is available on this system (chrony vs chronyd)
+                local _svc=""
+                for _u in chrony chronyd; do
+                    if systemctl list-unit-files "${_u}.service" 2>/dev/null | grep -q "${_u}.service"; then
+                        _svc="$_u"
+                        break
+                    fi
+                done
+                # Fallback: try enabling each to detect the real unit
+                if [[ -z "$_svc" ]]; then
+                    if systemctl enable chrony >/dev/null 2>&1; then
+                        _svc=chrony
+                    elif systemctl enable chronyd >/dev/null 2>&1; then
+                        _svc=chronyd
+                    else
+                        _svc=chrony  # last resort default
+                    fi
                 fi
-                systemctl start "${_svc}" 2>/dev/null || true
+
+                systemctl enable "$_svc" 2>/dev/null || true
+                systemctl restart "$_svc" 2>/dev/null || systemctl start "$_svc" 2>/dev/null || true
 
                 # Give it a moment to come up and retry starting if it immediately exited
-                sleep 1
+                sleep 2
 
                 # If the selected unit isn't active, try the other common name
                 if ! systemctl is-active --quiet "${_svc}"; then
-                    if [[ "${_svc}" == "chronyd" ]]; then
-                        systemctl start chrony 2>/dev/null || true
-                        _svc=chrony
-                    else
-                        systemctl start chronyd 2>/dev/null || true
-                        _svc=chronyd
+                    local _alt_svc
+                    [[ "${_svc}" == "chrony" ]] && _alt_svc="chronyd" || _alt_svc="chrony"
+                    systemctl restart "$_alt_svc" 2>/dev/null || systemctl start "$_alt_svc" 2>/dev/null || true
+                    if systemctl is-active --quiet "$_alt_svc"; then
+                        _svc="$_alt_svc"
                     fi
                 fi
 
