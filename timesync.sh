@@ -25,6 +25,35 @@ REGION=""
 ORG=""
 DETECTED_TZ=""
 
+# 非交互环境检测与终端命令安全包装
+is_interactive_terminal() {
+    [[ -t 1 ]] && [[ -n "${TERM:-}" ]]
+}
+
+safe_clear() {
+    if is_interactive_terminal && command -v clear &>/dev/null; then
+        clear || true
+    fi
+}
+
+safe_tput() {
+    if is_interactive_terminal && command -v tput &>/dev/null; then
+        tput "$@" 2>/dev/null || true
+    fi
+}
+
+safe_stty() {
+    if [[ -t 0 ]] && command -v stty &>/dev/null; then
+        stty "$@" 2>/dev/null || true
+    fi
+}
+
+prompt_enter_to_continue() {
+    if [[ -t 0 ]] && is_interactive_terminal; then
+        read -r -p "按 Enter 继续..." _unused || true
+    fi
+}
+
 # 日志函数
 log_info()  { echo -e "  ${BLUE}[INFO]${NC}  $1"; }
 log_ok()    { echo -e "  ${GREEN}[ OK ]${NC}  $1"; }
@@ -666,10 +695,7 @@ stage_show_result() {
 # 主函数
 #================================================================
 main() {
-    # Only clear when running in an interactive terminal
-    if [[ -t 1 ]] && [[ -n "${TERM:-}" ]]; then
-        clear || true
-    fi
+    safe_clear
     echo ""
     separator
     echo -e "${CYAN}          VPS 时区和时间自动校准脚本${NC}"
