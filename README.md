@@ -12,6 +12,7 @@
 | 想先审阅脚本 | 先下载再执行 | 更适合生产环境 |
 | SSH / CI / cron | 直接运行 | 已兼容无 TTY / 无 TERM |
 | Debian 13 | 直接运行最新版本 | 已处理 chrony runtime-dir / stale pid 问题 |
+| 已运行过的 VPS 重新执行 | 直接运行最新版本 | v1.2.6 修复二次运行 chrony 无法启动问题 |
 | 同步失败排查 | 跑 diagnostics 脚本 | 自动收集 systemctl / journal / 权限信息 |
 
 ## 快速开始
@@ -39,6 +40,7 @@ bash timesync.sh
 - 🔧 **多 NTP 工具支持**：优先使用 chrony，兼容 ntpdate / ntpd；缺失时自动安装。
 - 🛡️ **冲突服务处理**：自动处理 systemd-timesyncd / ntpd 等可能冲突的服务。
 - ✅ **Debian 13 兼容**：启动 chrony 前修复 `/run/chrony`、`/var/lib/chrony`、`/var/log/chrony` 权限并删除 stale pid。
+- 🔄 **二次运行安全**：停止服务后清理所有 stale PID/socket，循环停止 `chrony`/`chronyd` 两个单元，兼容 `_chrony`（RHEL）和 `chrony`（Debian）用户名，避免重复执行时 daemon 启动失败。
 - 🤖 **非交互安全**：支持 `curl | bash`、SSH/CI/cron 等无 TTY 场景，终端命令自动跳过。
 - 🧪 **CI 保障**：GitHub Actions 自动运行 `bash -n` 和 ShellCheck。
 
@@ -96,7 +98,7 @@ journalctl -u chrony -n 200 --no-pager
 - 上一次 chronyd 异常退出，systemd 中仍有残留进程；
 - chrony 配置写入后 daemon 尚未完全 ready。
 
-脚本已内置处理：创建目录、修正 `_chrony` 权限、删除 stale pid、重启 chrony、等待 daemon ready，再执行 `makestep`。若仍失败，请执行：
+脚本已内置处理：创建目录、修正 `_chrony`/`chrony` 权限、删除 stale PID/socket、停止所有 chrony 相关单元并 pkill 残留进程、重启 chrony、等待 daemon ready，再执行 `makestep`。若仍失败，请执行：
 
 ```bash
 systemctl status chrony --no-pager -l
@@ -126,6 +128,7 @@ bash scripts/collect-diagnostics.sh
 
 ## 变更日志（摘录）
 
+- **v1.2.6**：修复在已运行过的 VPS 上二次执行时 `506 Cannot talk to daemon` 的问题：停止服务后清理 stale PID/socket，循环停止 `chrony`/`chronyd` 两个单元，pkill 残留进程，兼容 Debian/RHEL chrony 用户名，改用 `restart` 确保完全重启。
 - **v1.2.5**：新增 English README、诊断脚本与一行速览表。
 - **v1.2.4**：非交互环境安全加固；新增 safe wrapper；整理 README；增加 GitHub Actions CI。
 - **v1.2.3**：修复 Debian 13 chrony runtime-dir / stale pid 导致 `chronyc makestep` 失败。
