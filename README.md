@@ -2,24 +2,25 @@
 
 [![Shell CI](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml/badge.svg)](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml) [![Release](https://img.shields.io/github/v/release/brucelau1987cn/timesync?color=blue&label=version)](https://github.com/brucelau1987cn/timesync/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<<<<<<< HEAD
 一个面向 VPS 的一键时区与时间校准脚本：根据公网 IP 自动识别时区，配置系统时区，并优先使用 chrony 做时间同步。支持 Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等常见 Linux 发行版。
-=======
-[![Shell CI](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml/badge.svg)](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml)
-[![ShellCheck](https://img.shields.io/badge/ShellCheck-passing-brightgreen)](https://github.com/koalaman/shellcheck)
-[![Release](https://img.shields.io/github/v/release/brucelau1987cn/timesync?color=blue&label=version)](https://github.com/brucelau1987cn/timesync/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
->>>>>>> 0a13d16 (docs: add CI badge to README)
+
+## 一行速览
+
+| 场景 | 推荐做法 | 说明 |
+|---|---|---|
+| 新 VPS 初始化 | `curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh | bash` | 一步完成时区与时间同步 |
+| 想先审阅脚本 | 先下载再执行 | 更适合生产环境 |
+| SSH / CI / cron | 直接运行 | 已兼容无 TTY / 无 TERM |
+| Debian 13 | 直接运行最新版本 | 已处理 chrony runtime-dir / stale pid 问题 |
+| 同步失败排查 | 跑 diagnostics 脚本 | 自动收集 systemctl / journal / 权限信息 |
 
 ## 快速开始
 
-### 一键执行（需要 root 权限）
 ```bash
+# 一键执行（需要 root 权限）
 curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh | bash
-```
 
-### 或先下载审阅再运行
-```bash
+# 或先下载审阅再运行
 curl -fsSL -o timesync.sh https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh
 bash timesync.sh
 ```
@@ -106,8 +107,26 @@ journalctl -u chrony -n 200 --no-pager
 
 请确认使用的是最新版本（v1.2.4+）。该版本已修复无 `TERM` 环境下 `clear` 等终端命令导致脚本提前退出的问题。
 
+## 诊断脚本
+
+仓库内提供了一个便于复制执行的排查脚本：`scripts/collect-diagnostics.sh`
+
+```bash
+bash scripts/collect-diagnostics.sh
+```
+
+它会收集：
+
+- 操作系统与内核信息
+- chrony systemctl 状态与 journal
+- 关键目录权限与进程信息
+- chronyc tracking / sources / activity
+- 网络和 IP 信息
+- Debian 系 package 状态
+
 ## 变更日志（摘录）
 
+- **v1.2.5**：新增 English README、诊断脚本与一行速览表。
 - **v1.2.4**：非交互环境安全加固；新增 safe wrapper；整理 README；增加 GitHub Actions CI。
 - **v1.2.3**：修复 Debian 13 chrony runtime-dir / stale pid 导致 `chronyc makestep` 失败。
 - **v1.2.0**：修复 chrony/ntp 安装检测、ipinfo JSON 解析与 HTTP 兜底健壮性问题。
