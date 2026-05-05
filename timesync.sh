@@ -411,6 +411,17 @@ EOF
 
             # Ensure necessary directories exist for chrony
             mkdir -p /var/lib/chrony /var/run/chrony 2>/dev/null || true
+            # Ensure runtime dir has correct ownership for _chrony user when present
+            if id -u _chrony &>/dev/null; then
+                chown _chrony:_chrony /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
+                chmod 0750 /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
+                # remove stale pid file
+                rm -f /run/chrony/chronyd.pid 2>/dev/null || true
+            else
+                # fallback permissive mode
+                chmod 0755 /var/lib/chrony /var/run/chrony /var/log/chrony 2>/dev/null || true
+            fi
+
             if has_systemd; then
                 # Try common service unit names: chronyd (binary) or chrony (unit)
                 local _svc="chronyd"
@@ -421,7 +432,7 @@ EOF
                 fi
                 systemctl start "${_svc}" 2>/dev/null || true
 
-                # Give it a moment to come up
+                # Give it a moment to come up and retry starting if it immediately exited
                 sleep 1
 
                 # If the selected unit isn't active, try the other common name
@@ -435,10 +446,17 @@ EOF
                     fi
                 fi
 
+                # Wait up to 10s for the unit to be active (some distros start and then early-exit)
+                local _wait=0
+                while ! systemctl is-active --quiet "${_svc}" && [[ "$_wait" -lt 10 ]]; do
+                    sleep 1
+                    _wait=$(( _wait + 1 ))
+                done
+
                 # If chrony still isn't active, capture logs when possible to help debugging
                 if ! systemctl is-active --quiet "${_svc}"; then
                     if command -v journalctl &>/dev/null; then
-                        log_warn "chrony 服务未能成功启动，最近日志：\n$(journalctl -u ${_svc} -n 50 --no-pager 2>/dev/null | sed 's/^/  /')"
+                        log_warn "chrony 服务未能成功启动，最近日志：\n$(journalctl -u ${_svc} -n 200 --no-pager 2>/dev/null | sed 's/^/  /')"
                     else
                         log_warn "chrony 服务未能成功启动，无法读取 journalctl 日志。请手动检查服务状态。"
                     fi
@@ -454,6 +472,13 @@ EOF
 
             log_info "等待 Chrony 同步（6秒）..."
             sleep 6
+
+            # Wait for chronyc to be responsive before makestep
+            local _tries=0
+            while ! chronyc tracking >/dev/null 2>&1 && [[ "$_tries" -lt 5 ]]; do
+                sleep 1
+                _tries=$(( _tries + 1 ))
+            done
 
             if chronyc -a makestep >/dev/null 2>&1; then
                 sync_ok=true
