@@ -1,141 +1,119 @@
-# ⏰ VPS 时区 & 时间自动校准脚本
+# ⏰ timesync — VPS 时区与时间自动校准脚本
 
-自动根据 VPS 公网 IP 地址识别所属时区，配置系统时区并通过 NTP 同步时间，全程无需手动操作。
+[![Shell CI](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml/badge.svg)](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml) [![Release](https://img.shields.io/github/v/release/brucelau1987cn/timesync?color=blue&label=version)](https://github.com/brucelau1987cn/timesync/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[![Shell CI](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml/badge.svg)](https://github.com/brucelau1987cn/timesync/actions/workflows/shell-ci.yml)
-[![ShellCheck](https://img.shields.io/badge/ShellCheck-passing-brightgreen)](https://github.com/koalaman/shellcheck)
-[![Release](https://img.shields.io/github/v/release/brucelau1987cn/timesync?color=blue&label=version)](https://github.com/brucelau1987cn/timesync/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+一个面向 VPS 的一键时区与时间校准脚本：根据公网 IP 自动识别时区，配置系统时区，并优先使用 chrony 做时间同步。支持 Debian/Ubuntu、CentOS/RHEL、Alpine、Arch 等常见 Linux 发行版。
 
-## ✨ 特性
-
-- 🌐 **智能 IP 归属检测** — 优先从 ipinfo.io 获取时区，多来源自动兜底
-- 🕐 **时区全覆盖** — 支持亚洲、欧洲、北美、南美、大洋洲、非洲主要时区
-- 🛡️ **冲突自动处理** — 自动停止 systemd-timesyncd / ntpd 等冲突服务
-- 🔧 **多工具支持** — chrony / ntpdate / ntpd 全自动检测安装
-- 🌐 **HTTP 兜底** — NTP 不通时自动尝试 HTTP Date 头同步
-- 📦 **多发行版支持** — Debian/Ubuntu、CentOS/RHEL、Alpine、Arch
-- 🐚 **ShellCheck 零警告** — 通过严格静态检查，兼容 POSIX sed
-- 🤖 **非交互安全** — 支持 `curl | bash`、SSH/CI/cron 等无 TTY 环境运行，避免终端命令导致脚本提前退出
-
-## 🔄 工作流程
-
-```
-阶段一：获取公网IP和时区
-  └─ 多个 IP 来源自动兜底 + 格式校验
-
-阶段二：设置系统时区
-  └─ timedatectl 优先，ln -s 链接兜底，失败时自动恢复旧链接
-
-阶段三：NTP时间同步
-  └─ 自动检测/安装 chrony → 就近 NTP 服务器同步
-
-阶段四：输出结果汇总
-  └─ IP信息 / 时区信息 / 同步前后时间对比
-```
-
-## 🔧 NTP 工具处理逻辑
-
-```
-检测系统已安装的 NTP 工具
-├── 有 chronyd  → 直接使用（推荐）
-├── 有 ntpdate  → 单次同步
-├── 有 ntpd     → 配置并启动
-└── 都没有 → 自动安装
-    ├── 安装 chrony   → 成功则使用
-    ├── 安装 ntpdate  → 成功则使用
-    ├── 安装 ntp      → 成功则使用
-    └── 全部失败 → HTTP Date 头兜底同步
-```
-
-## 🚀 一键运行
+## 快速开始
 
 ```bash
+# 一键执行（需要 root 权限）
 curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh | bash
+
+# 或先下载审阅再运行
+curl -fsSL -o timesync.sh https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh
+bash timesync.sh
 ```
 
-> 需要 root 权限运行
+## 适用场景
 
-### 🤖 非交互环境运行
+- 新 VPS 初始化后自动设置正确时区与系统时间
+- 远程 SSH / 云面板 / 自动化脚本中无人值守执行
+- Debian 13 等新系统上自动处理 chrony runtime 目录与陈旧 pid 问题
+- NTP 不通时自动降级为 HTTP Date 头兜底同步
 
-脚本已兼容无 TTY/无 `TERM` 的非交互环境，例如 SSH 远程命令、CI、cron、自动化面板等。终端专用命令会自动跳过，不会因为 `TERM environment variable not set` 导致 `set -euo pipefail` 提前退出。
+## 主要特性
+
+- 🌐 **智能时区检测**：通过公网 IPv4 自动识别地理位置与时区，多来源兜底。
+- 🕐 **自动时区配置**：优先使用 `timedatectl`，失败时使用 `/etc/localtime` 链接方式并带回滚保护。
+- 🔧 **多 NTP 工具支持**：优先使用 chrony，兼容 ntpdate / ntpd；缺失时自动安装。
+- 🛡️ **冲突服务处理**：自动处理 systemd-timesyncd / ntpd 等可能冲突的服务。
+- ✅ **Debian 13 兼容**：启动 chrony 前修复 `/run/chrony`、`/var/lib/chrony`、`/var/log/chrony` 权限并删除 stale pid。
+- 🤖 **非交互安全**：支持 `curl | bash`、SSH/CI/cron 等无 TTY 场景，终端命令自动跳过。
+- 🧪 **CI 保障**：GitHub Actions 自动运行 `bash -n` 和 ShellCheck。
+
+## 运行流程
+
+1. 获取公网 IP 与时区信息。
+2. 根据识别结果配置系统时区。
+3. 检测或安装 chrony / ntpdate / ntpd。
+4. 写入同步配置并启动时间同步服务。
+5. 等待 chrony daemon 可响应后执行 `chronyc -a makestep`。
+6. 输出同步源、tracking 状态和最终时间信息。
+
+## 非交互环境说明
+
+脚本已兼容无 TTY / 无 `TERM` 的环境，例如 SSH 远程命令、CI、cron、自动化面板等。
 
 ```bash
-# 远程/自动化环境推荐写法
+# 推荐：直接执行即可
 curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh | bash
 
-# 如果你的运行器强制要求 TERM，也可以显式设置
+# 如果你的运行器强制要求 TERM，可显式设置
 TERM=xterm bash timesync.sh
 ```
 
-## 🛠️ 后续常用命令
+内部已对 `clear`、`tput`、`stty`、交互提示等终端专用操作提供 safe wrapper，避免非交互环境下提前退出。
+
+## 常用验证命令
 
 ```bash
-# 查看当前时间和时区状态
+# 查看当前时区与 NTP 总体状态
 timedatectl
 
-# 查看 Chrony 同步精度
+# 查看 chrony 同步状态
 chronyc tracking
 
-# 查看 NTP 服务器连接状态
+# 查看 chrony 同步源
 chronyc sources -v
 
-# 手动强制同步一次（立即生效）
-chronyc makestep
+# 手动强制同步一次
+chronyc -a makestep
 
-# 查看硬件时钟
-hwclock --show
+# 查看 chrony 日志
+journalctl -u chrony -n 200 --no-pager
 ```
 
-## 📋 支持的时区（部分）
+## 常见问题
 
-| 地区 | 时区 | 优先 NTP 服务器 |
-|------|------|-----------------|
-| 🇨🇳 中国大陆 | Asia/Shanghai | ntp.aliyun.com / ntp.tencent.com |
-| 🇭🇰 香港 | Asia/Hong_Kong | hk.pool.ntp.org |
-| 🇯🇵 日本 | Asia/Tokyo | jp.pool.ntp.org |
-| 🇰🇷 韩国 | Asia/Seoul | kr.pool.ntp.org |
-| 🇸🇬 新加坡 | Asia/Singapore | sg.pool.ntp.org |
-| 🇹🇼 台湾 | Asia/Taipei | tw.pool.ntp.org |
-| 🇮🇳 印度 | Asia/Kolkata | in.pool.ntp.org |
-| 🇬🇧 英国 | Europe/London | uk.pool.ntp.org |
-| 🇩🇪 德国/法国 | Europe/Berlin | de.pool.ntp.org |
-| 🇷🇺 俄罗斯 | Europe/Moscow | ru.pool.ntp.org |
-| 🇺🇸 美国 | America/New_York 等 | us.pool.ntp.org |
-| 🇨🇦 加拿大 | America/Toronto / Vancouver | ca.pool.ntp.org |
-| 🇧🇷 巴西 | America/Sao_Paulo | br.pool.ntp.org |
-| 🇦🇺 澳大利亚 | Australia/* | oceania.pool.ntp.org |
-| 🌐 其他 | - | pool.ntp.org + Google/Cloudflare |
+### `chronyc` 提示 `506 Cannot talk to daemon`
 
-## 🐛 已知问题
+通常表示 chronyd 没有正常运行，常见原因包括：
 
-- IPv6-only 环境暂不支持
-- 非 root 用户需配合 `sudo` 使用
+- `/run/chrony` 不存在或权限不正确；
+- `/var/lib/chrony`、`/var/log/chrony` 归属不匹配；
+- 存在陈旧的 `/run/chrony/chronyd.pid`；
+- 上一次 chronyd 异常退出，systemd 中仍有残留进程；
+- chrony 配置写入后 daemon 尚未完全 ready。
 
-## 📜 更新日志
+脚本已内置处理：创建目录、修正 `_chrony` 权限、删除 stale pid、重启 chrony、等待 daemon ready，再执行 `makestep`。若仍失败，请执行：
 
-### [1.2.0] — 2026-04-28
+```bash
+systemctl status chrony --no-pager -l
+journalctl -u chrony -n 200 --no-pager
+```
 
-- 🐛 **修复**: `install_package` 安装成功检测逻辑错误——用包名 `chrony` 检查二进制是否存在，但实际二进制名为 `chronyd`，导致 chrony 安装成功却误报失败、跳过后续安装流程，需第二次运行才能工作（`ntp` 包同理）
-- 🐛 **修复**: ipinfo.io 使用自定义 UA 头导致返回 HTML 而非 JSON，jq 解析时报 `parse error: Invalid numeric literal`
-- 🧹 **优化**: jq 命令静默处理非 JSON 输入，失败时自动降级到 sed 兜底
+### 脚本在 SSH/面板/cron 中无输出或提前退出
 
-### [1.2.3] — 2026-05-05
+请确认使用的是最新版本（v1.2.4+）。该版本已修复无 `TERM` 环境下 `clear` 等终端命令导致脚本提前退出的问题。
 
-- 🐛 **修复 (Debian 13)**: 解决 chrony 在 Debian 13(trixie) 上启动后立即退出，导致 `chronyc makestep` 报错 `506 Cannot talk to daemon` 的问题。
-  - 在启动 chrony 之前确保 runtime/state/log 目录存在：`/var/run/chrony`、`/var/lib/chrony`、`/var/log/chrony`。
-  - 若系统存在 `_chrony` 用户，将这些目录的归属设置为 `_chrony:_chrony` 并应用合适权限；删除可能存在的陈旧 PID `/run/chrony/chronyd.pid`。
-  - 启动/重启 chrony 后等待最多 10s 以确保 systemd 单元稳定运行，并在调用 `chronyc -a makestep` 之前等待 chronyc 响应（最多重试 5 次）。
-  - 当 chrony 无法启动时扩展 journal 日志输出以方便排查。
-- 🛡️ **加固**: 非交互环境运行时自动跳过 `clear` 等终端专用操作，避免因无 `TERM` 导致脚本提前退出。
-- 📚 **文档**: 新增非交互运行说明，覆盖 SSH/CI/cron/自动化面板等场景。
+## 变更日志（摘录）
 
-### [1.1.0] — 2026-04-28
+- **v1.2.4**：非交互环境安全加固；新增 safe wrapper；整理 README；增加 GitHub Actions CI。
+- **v1.2.3**：修复 Debian 13 chrony runtime-dir / stale pid 导致 `chronyc makestep` 失败。
+- **v1.2.0**：修复 chrony/ntp 安装检测、ipinfo JSON 解析与 HTTP 兜底健壮性问题。
 
-- 🐛 **修复**: 中国 VPS 上 HTTP 兜底因 `set -euo pipefail` 导致脚本意外退出
-- 🐛 **修复**: Alpine Linux / BusyBox 下 `grep -oP` 不兼容，JSON 解析 fallback 失效
-- 🛡️ **增强**: `/etc/localtime` 链接失败时自动恢复旧链接，避免时区丢失
-- 🧹 **优化**: 提取 `fetch_http_date()` 函数消除 40 行重复代码
-- 🔍 **检查**: 主函数增加 `curl` 依赖预检，缺失时自动安装
-- 🧪 **质量**: 通过 ShellCheck 静态检查，零警告
+完整版本见：[GitHub Releases](https://github.com/brucelau1987cn/timesync/releases)
 
+## 贡献与质量保障
+
+- 欢迎提交 PR 修复兼容性问题、补充测试或改进文档。
+- PR 会自动运行 Shell CI：`bash -n timesync.sh` + ShellCheck。
+
+## 安全提示
+
+不要在 Issue、PR、聊天或提交记录中暴露 GitHub token、服务器密码、私钥等敏感凭据。若已暴露，请立即撤销/rotate。
+
+## License
+
+MIT
