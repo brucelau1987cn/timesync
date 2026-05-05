@@ -6,12 +6,12 @@
 
 ## 快速开始
 
-# 一键执行（需要 root 权限）
+### 一键执行（需要 root 权限）
 ```bash
 curl -fsSL https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh | bash
 ```
 
-# 或先下载审阅再运行
+### 或先下载审阅再运行
 ```bash
 curl -fsSL -o timesync.sh https://raw.githubusercontent.com/brucelau1987cn/timesync/main/timesync.sh
 bash timesync.sh
