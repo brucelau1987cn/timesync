@@ -16,7 +16,7 @@ journalctl -u chrony -n 500 --no-pager > "$out_dir/chrony-journal.txt" 2>&1 || t
 ls -ld /run /run/chrony /var/run/chrony /var/lib/chrony /var/log/chrony /etc/chrony > "$out_dir/chrony-dirs.txt" 2>&1 || true
 stat -c '%n %U %G %a' /var/lib/chrony /var/log/chrony /run/chrony 2>/dev/null > "$out_dir/chrony-stats.txt" || true
 # Processes and sockets
-ps -ef | grep [c]hronyd > "$out_dir/chronyd-procs.txt" 2>&1 || true
+ps -ef | grep '[c]hronyd' > "$out_dir/chronyd-procs.txt" 2>&1 || true
 ss -ltnp | grep chronyd > "$out_dir/chronyd-sockets.txt" 2>/dev/null || true
 # chronyc outputs
 chronyc tracking > "$out_dir/chronyc-tracking.txt" 2>&1 || true

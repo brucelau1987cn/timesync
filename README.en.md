@@ -13,6 +13,7 @@ A one-shot script for VPS timezone and system time calibration: auto-detects tim
 | SSH / CI / cron | Run directly | Non-interactive / no-TTY safe |
 | Debian 13 | Run latest version | Handles chrony runtime-dir / stale PID |
 | Re-running on an existing VPS | Run latest version | v1.2.6 fixes chrony daemon failure on re-run |
+| Running behind TUN / transparent proxy | `bash timesync.sh --egress eth0` | Timezone follows the physical NIC, not the exit node |
 | Troubleshooting sync failures | Run diagnostics script | Auto-collects systemctl / journal / permissions |
 
 ## Quickstart
@@ -26,6 +27,40 @@ curl -fsSL -o timesync.sh https://raw.githubusercontent.com/brucelau1987cn/times
 bash timesync.sh
 ```
 
+## TUN / Transparent Proxy (v1.3.0+)
+
+With sing-box / mihomo / clash TUN mode enabled, the default route points at `tun0`, so the detected public IP is the **exit node** and the timezone gets set to the wrong country.
+
+Since v1.3.0 the script lists every interface with its real egress and lets you choose:
+
+```bash
+bash timesync.sh --list          # inspect only, no changes
+bash timesync.sh --egress eth0   # physical NIC (recommended)
+bash timesync.sh --egress tun0   # follow the exit node (explicit choice)
+bash timesync.sh --tz Asia/Shanghai   # no network at all
+```
+
+Interactive runs show a menu; non-interactive runs (`curl | bash`, cron, panels) default to the **physical NIC** instead of silently using the exit node.
+
+| Flag | Description |
+|---|---|
+| `--egress auto` | Auto-select (prefer physical NIC, ignore saved choice) |
+| `--egress <iface>` | Use the given interface, e.g. `eth0` |
+| `--egress <IP>` | Use the interface owning that local IP |
+| `--tz <zone>` | Force a timezone, skip all network probing |
+| `--list` | List interfaces and egress only |
+| `--dry-run` | Print the config that would be written |
+| `--yes` | Non-interactive, accept recommendations |
+
+The choice is stored in `/etc/timesync.conf` and reused on later runs.
+
+### How it bypasses the tunnel
+
+1. **Probing**: `curl --interface eth0` uses `SO_BINDTODEVICE`, so the route lookup is restricted to the physical NIC and skips the TUN policy routes.
+2. **DNS**: TUN setups often hijack DNS / use fake-ip (`198.18.x.x`). The script resolves names over **DoH to an IP literal** (`1.1.1.1`, falling back to AliDNS `223.5.5.5`) and connects with `--resolve`, never touching the system resolver.
+3. **NTP**: with chrony ≥ 4.0 it writes `bindacqdevice eth0` so NTP client sockets are bound to the physical NIC, and NTP hostnames are pre-resolved via DoH to avoid fake-ip.
+4. chrony < 4.0 / ntpdate / ntpd cannot bind to a device; the script warns and suggests `--tz` or upgrading chrony.
+
 ## Use Cases
 
 - Auto-configure correct timezone and system clock after new VPS provisioning
@@ -36,6 +71,7 @@ bash timesync.sh
 ## Main Features
 
 - 🌐 **Smart timezone detection**: auto-detect geolocation and timezone from public IPv4, with multiple fallback sources.
+- 🕳️ **TUN-aware egress selection**: detects tun/wg/sing-box/mihomo interfaces, lets you probe via the physical NIC so the timezone is not taken from the exit node; NTP queries are pinned to the same interface.
 - 🕐 **Safe timezone configuration**: prefer `timedatectl`; fall back to `/etc/localtime` symlink with rollback protection.
 - 🔧 **Multi-NTP tool support**: prefer chrony, support ntpdate / ntpd as fallbacks; auto-install if missing.
 - 🛡️ **Conflict service handling**: auto-stop systemd-timesyncd / ntpd to avoid conflicts.
@@ -46,6 +82,7 @@ bash timesync.sh
 
 ## How It Works
 
+0. Select the probing egress (detect TUN, optionally pin a physical NIC).
 1. Fetch public IP and detect timezone.
 2. Configure system timezone.
 3. Detect or install chrony / ntpdate / ntpd.

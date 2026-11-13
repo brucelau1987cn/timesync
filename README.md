@@ -13,6 +13,7 @@
 | SSH / CI / cron | 直接运行 | 已兼容无 TTY / 无 TERM |
 | Debian 13 | 直接运行最新版本 | 已处理 chrony runtime-dir / stale pid 问题 |
 | 已运行过的 VPS 重新执行 | 直接运行最新版本 | v1.2.6 修复二次运行 chrony 无法启动问题 |
+| 开了 TUN / 透明代理 | `bash timesync.sh --egress eth0` | 时区按物理网卡归属地，不被落地节点带偏 |
 | 同步失败排查 | 跑 diagnostics 脚本 | 自动收集 systemctl / journal / 权限信息 |
 
 ## 快速开始
@@ -26,6 +27,54 @@ curl -fsSL -o timesync.sh https://raw.githubusercontent.com/brucelau1987cn/times
 bash timesync.sh
 ```
 
+## TUN / 透明代理环境（v1.3.0+）
+
+开了 sing-box / mihomo / clash 的 TUN 模式后，系统默认路由指向 `tun0`，脚本探测到的公网 IP 是**落地节点**，时区就会被带偏（香港机器被设成日本时区这种）。
+
+v1.3.0 起，脚本会先列出所有网卡及其真实出口，让你选：
+
+```bash
+# 只查看，不改系统
+bash timesync.sh --list
+
+  可用出口：
+  * 1) eth0       203.0.113.10    → 203.0.113.10    [直连][默认路由]
+    2) tun0       198.18.0.2       → 45.76.xxx.xxx    [隧道]
+    3) docker0    172.17.0.1       → 无公网出口  [容器]
+
+# 指定物理网卡（推荐）
+bash timesync.sh --egress eth0
+
+# 跟随落地节点（你主动要的）
+bash timesync.sh --egress tun0
+
+# 完全不联网，手动指定
+bash timesync.sh --tz Asia/Shanghai
+```
+
+交互式运行时（有 TTY）会直接弹菜单让你选序号；非交互（`curl | bash`、cron、面板）默认选**物理网卡**，不会静默用落地时区。
+
+### 参数
+
+| 参数 | 说明 |
+|---|---|
+| `--egress auto` | 自动选择（优先物理网卡，忽略已保存的选择） |
+| `--egress <网卡名>` | 指定出口，如 `eth0` |
+| `--egress <IP>` | 指定出口源 IP，自动反查网卡 |
+| `--tz <时区>` | 手动指定时区，完全跳过网络探测 |
+| `--list` | 只列出网卡与出口，不做修改 |
+| `--dry-run` | 只打印将写入的配置 |
+| `--yes` | 非交互，全部用推荐值 |
+
+选择结果保存在 `/etc/timesync.conf`，下次运行自动沿用；`--egress auto` 可重新选择。
+
+### 实现方式（为什么能绕过 TUN）
+
+1. **探测请求**：`curl --interface eth0` 走 `SO_BINDTODEVICE`，路由查找被限制在物理网卡上，不经过 TUN 的策略路由。
+2. **DNS**：TUN 常带 fake-ip / DNS 劫持，系统解析会返回 `198.18.x.x`。脚本改用 **DoH over IP 直连**（`1.1.1.1`，失败回落阿里 `223.5.5.5`）自行解析，再用 `--resolve` 连接，全程不碰系统 DNS。
+3. **NTP**：chrony ≥ 4.0 时写入 `bindacqdevice eth0`，NTP 客户端 socket 绑定物理网卡；同时把 NTP 域名用 DoH 解析成 IP 写进配置，避免 chrony 自己解析时被 fake-ip 坑。
+4. chrony < 4.0 / ntpdate / ntpd 不支持按网卡绑定，脚本会明确告警，并提示改用 `--tz` 或升级 chrony。
+
 ## 适用场景
 
 - 新 VPS 初始化后自动设置正确时区与系统时间
@@ -36,6 +85,7 @@ bash timesync.sh
 ## 主要特性
 
 - 🌐 **智能时区检测**：通过公网 IPv4 自动识别地理位置与时区，多来源兜底。
+- 🕳️ **TUN 环境出口选择**：自动识别 tun/wg/sing-box/mihomo 等隧道网卡，可指定物理网卡探测，避免时区跟随落地节点；NTP 查询同步锁定出口。
 - 🕐 **自动时区配置**：优先使用 `timedatectl`，失败时使用 `/etc/localtime` 链接方式并带回滚保护。
 - 🔧 **多 NTP 工具支持**：优先使用 chrony，兼容 ntpdate / ntpd；缺失时自动安装。
 - 🛡️ **冲突服务处理**：自动处理 systemd-timesyncd / ntpd 等可能冲突的服务。
@@ -46,6 +96,7 @@ bash timesync.sh
 
 ## 运行流程
 
+0. 选择探测出口（识别 TUN，可指定物理网卡）。
 1. 获取公网 IP 与时区信息。
 2. 根据识别结果配置系统时区。
 3. 检测或安装 chrony / ntpdate / ntpd。
@@ -128,6 +179,7 @@ bash scripts/collect-diagnostics.sh
 
 ## 变更日志（摘录）
 
+- **v1.3.0**：新增 TUN/透明代理出口选择（`--egress` / `--tz` / `--list` / `--dry-run`）。探测走 `SO_BINDTODEVICE` + DoH 自解析，chrony 写入 `bindacqdevice` 锁定 NTP 出口；修复 `set -euo pipefail` 下 `readlink`/`chronyc` 失败导致脚本静默退出的问题（Alpine 无 `/etc/localtime` 链接时必现）。
 - **v1.2.6**：修复在已运行过的 VPS 上二次执行时 `506 Cannot talk to daemon` 的问题：停止服务后清理 stale PID/socket，循环停止 `chrony`/`chronyd` 两个单元，pkill 残留进程，兼容 Debian/RHEL chrony 用户名，改用 `restart` 确保完全重启。
 - **v1.2.5**：新增 English README、诊断脚本与一行速览表。
 - **v1.2.4**：非交互环境安全加固；新增 safe wrapper；整理 README；增加 GitHub Actions CI。
@@ -148,4 +200,3 @@ bash scripts/collect-diagnostics.sh
 ## License
 
 MIT
-
